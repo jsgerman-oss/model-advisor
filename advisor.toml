@@ -13,6 +13,10 @@ default_provider = "claude"
 # it. Defaults to the highest-rank (most-capable) tier if omitted.
 baseline_tier = "opus"
 
+# --- v3 advanced backends (opt-in; default off) — see README "Advanced modes" ---
+# lcb_backend = "wilson"        # gate bound: "wilson" (default) | "conformal" (distribution-free split-conformal)
+# pooling     = "closed-form"   # partial pooling: "closed-form" (default) | "empirical-bayes" (full hierarchical)
+
 # --------------------------------------------------------------------------- #
 # Roster — the user's cost-ordered model tiers. rank 1 = cheapest.            #
 # in_cost / out_cost are $/MTok (illustrative; replace with your rate sheet). #
@@ -152,3 +156,13 @@ cold_m_lo   = 0.5    # cheapest-tier cold-start prior mean
 w_close     = 1.0    # quality channel weights (close < review < eval)
 w_review    = 3.0
 w_eval      = 5.0
+
+# --- v3 advanced modes (opt-in; default off) — see README "Advanced modes" ---
+# mode               = "lcb"   # selection rule: "lcb" (deterministic, default) | "thompson" (seeded sampling)
+# continuous_quality = false   # accept graded q in [0,1] outcomes (else binary pass/fail)
+# changepoint        = false   # Page-Hinkley drift detection + recency re-weighting (`advisor drift`)
+
+# --- v3 multi-tenant federation (opt-in; default: no peers) — `advisor federate` ---
+# [federation]
+# peers = ["../peer-repo/.beads/telemetry/advisor-federation.json"]  # aggregates-only peer exports to merge
+# trust = 0.3                                                         # weight on borrowed peer evidence (local always dominates)

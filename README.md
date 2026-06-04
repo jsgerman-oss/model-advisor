@@ -97,7 +97,7 @@ and runs the **CC-TS decision rule** on every recommendation:
 | Layer | What it is | File |
 |-------|------------|------|
 | **Engine** | the pure, stdlib-only CC-TS decision rule + cell store | `modeladvisor/` |
-| **CLI** | `advise` / `inspect` / `apply` / `auto-apply` | `bin/advisor` |
+| **CLI** | `advise` / `inspect` / `apply` / `auto-apply` + advanced (`eval-schedule` / `federate` / `drift`) | `bin/advisor` |
 | **Skill** | teaches agents to advise-before-dispatch | `skills/use-model-advisor/SKILL.md` |
 | **Prompt fragment** | the cost-aware discipline, in every agent's context | `template-fragments/model-advisor.template.md` |
 | **Telemetry hook** | records each invocation (Stop / SubagentStop) | `overlay/…/settings.json` + `hooks/capture-invocation.sh` |
@@ -136,7 +136,8 @@ case it recommends the safe tier. Full math: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## The surfaces
 
-Two pure reads and one deliberate write.
+Two pure reads and one deliberate write — plus the opt-in
+[Advanced modes](#advanced-modes-opt-in) surfaces (`eval-schedule`, `federate`, `drift`).
 
 | Command | Does | Mutates? |
 |---------|------|----------|

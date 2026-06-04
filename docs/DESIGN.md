@@ -683,6 +683,15 @@ mutates beads, or changes config.
 
 ### 7.3 Deferred (explicitly out of v1 scope; designed-for, not built)
 
+> **STATUS — implemented in v3 (2026-06-03).** Every item below is now built, each behind a
+> **default-off** flag, so the v1 design context that follows still describes the *default*
+> behavior. Map: Layer-4 eval → `advisor eval-schedule`; conformal → `lcb_backend=conformal`;
+> hierarchical → `pooling=empirical-bayes` (stdlib empirical-Bayes; optional PyMC extra);
+> federation → `[federation]` + `advisor federate`; cascade → `advise --cascade-bead`;
+> continuous → `continuous_quality=true`; Thompson → `mode=thompson`; change-point →
+> `changepoint=true` + `advisor drift`. See the README **"Advanced modes"** and
+> `docs/V3-BUILD-BRIEF.md`. The text below is preserved as the original design rationale.
+
 - **Layer 4 auto-scheduled eval.** v1 *records* the uncertainty trigger and
   *surfaces* the highest-value eval in `inspect`, but does not auto-dispatch eval
   runs. Auto-scheduling proportional to posterior width is a later bead. The
