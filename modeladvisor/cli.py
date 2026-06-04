@@ -439,6 +439,118 @@ def cmd_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# auto-apply  — sweep EVERY agent; set each to its conservative per-agent tier
+# --------------------------------------------------------------------------- #
+
+def cmd_auto_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
+    """Drive :func:`modeladvisor.autoapply.auto_apply` over the whole roster.
+
+    Default-safe: runs in **dry-run** unless ``--apply`` is given.  Emits a loud
+    per-agent summary (and the full structured report under ``--json``).  The
+    per-agent policy + apply gate live in :mod:`modeladvisor.autoapply`; this is
+    only the operator surface.
+    """
+    from modeladvisor import autoapply as _autoapply
+
+    engine = _load_engine()
+    state = _resolve_state(args)
+
+    # Default to dry-run; only --apply opts into writing.  (--dry-run is accepted
+    # explicitly and is the default, so passing it is a harmless no-op.)
+    dry_run = not getattr(args, "apply", False)
+
+    scope = "town"
+    rig = getattr(args, "rig", None)
+    if rig:
+        scope = f"rig:{rig}"
+
+    report = _autoapply.auto_apply(
+        state.cfg,
+        state.store,
+        scope=scope,
+        dry_run=dry_run,
+        provider=state.provider,
+        city=getattr(args, "city", None),
+        rig=rig,
+        engine=engine,
+    )
+
+    if getattr(args, "json", False):
+        json.dump(report.to_dict(), out, indent=2, default=str)
+        out.write("\n")
+        return _auto_apply_rc(report)
+
+    mode = "DRY-RUN (no files written)" if dry_run else "APPLY"
+    out.write(f"auto-apply [{report.scope}]  mode: {mode}\n")
+    out.write(f"  provider: {report.provider}\n")
+    for d in report.decisions:
+        _write_auto_decision(out, d, dry_run)
+
+    s = report.summary()
+    out.write(
+        "  ----------------------------------------------------------------\n"
+    )
+    out.write(
+        "  SUMMARY: {agents} agents | "
+        "{applied} applied | {dryrun} planned | {noop} no-op | "
+        "{skipped} skipped | {blocked} blocked | {error} error\n".format(
+            agents=s["agents"],
+            applied=s[_autoapply.STATUS_APPLIED],
+            dryrun=s[_autoapply.STATUS_DRYRUN],
+            noop=s[_autoapply.STATUS_NOOP],
+            skipped=s[_autoapply.STATUS_SKIPPED],
+            blocked=s[_autoapply.STATUS_BLOCKED],
+            error=s[_autoapply.STATUS_ERROR],
+        )
+    )
+    if dry_run and s[_autoapply.STATUS_DRYRUN]:
+        out.write(
+            "  NOTE: this was a dry run — re-run with --apply to write the "
+            f"{s[_autoapply.STATUS_DRYRUN]} planned change(s).\n"
+        )
+    return _auto_apply_rc(report)
+
+
+def _write_auto_decision(out: io.TextIOBase, d: Any, dry_run: bool) -> None:
+    """Render one per-agent decision line (+ detail) for the text report."""
+    tag = {
+        "applied": "APPLIED ",
+        "dry-run": "WOULD   ",
+        "noop": "noop    ",
+        "skipped": "skipped ",
+        "blocked": "BLOCKED ",
+        "error": "ERROR   ",
+    }.get(d.status, d.status)
+    cur = d.current_model if d.current_model is not None else "(unset)"
+    chosen = d.chosen_model or "?"
+    out.write(f"  [{tag}] {d.agent}\n")
+    out.write(
+        f"      tier: {d.chosen_tier or '?'}"
+        + (f" (binding shape: {d.binding_shape})" if d.binding_shape else "")
+        + f"   current: {cur} -> chosen: {chosen}\n"
+    )
+    if d.per_shape:
+        per = ", ".join(f"{k}={v}" for k, v in d.per_shape.items())
+        out.write(f"      per-shape: {per}\n")
+    if d.reason:
+        out.write(f"      why: {d.reason}\n")
+    if d.backup_path:
+        out.write(f"      backup: {d.backup_path}\n")
+
+
+def _auto_apply_rc(report: Any) -> int:
+    """Exit code: 1 if any per-agent error occurred, else 0.
+
+    A dry run with planned changes still returns 0 (it succeeded at planning);
+    operators / orders gate on the JSON/summary, not a non-zero rc, so a healthy
+    scheduled run is exit 0.
+    """
+    from modeladvisor import autoapply as _autoapply
+
+    return 1 if report.count(_autoapply.STATUS_ERROR) else 0
+
+
 def _default_shape_for(cfg: Any, agent: str) -> Optional[str]:
     """Resolve an agent's canonical default shape from config, if any.
 
@@ -852,6 +964,33 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="print the planned change without writing")
     ap.set_defaults(func=cmd_apply)
+
+    aa = sub.add_parser(
+        "auto-apply",
+        help="sweep EVERY agent; set each to its conservative per-agent tier "
+        "(safest across its shapes), evidence-gated. Dry-run by default.",
+    )
+    scope_grp = aa.add_mutually_exclusive_group()
+    scope_grp.add_argument(
+        "--town", action="store_true",
+        help="sweep all town/city agents (the default scope)",
+    )
+    scope_grp.add_argument(
+        "--rig", metavar="NAME",
+        help="narrow the config search + scope label to this rig",
+    )
+    aa.add_argument("--city", help="city root (else $GC_CITY or cwd)")
+    aa.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="compute + report the plan without writing (this is the DEFAULT)",
+    )
+    aa.add_argument(
+        "--apply", action="store_true", dest="apply",
+        help="actually write config changes (otherwise dry-run-safe)",
+    )
+    aa.add_argument("--json", action="store_true",
+                    help="emit the full structured per-agent report as JSON")
+    aa.set_defaults(func=cmd_auto_apply)
 
     return p
 
