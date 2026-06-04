@@ -19,6 +19,7 @@ Sampling](https://github.com/jsgerman-oss/research/tree/main/blackrim-model-advi
 [![Bound](https://img.shields.io/badge/gate-Wilson_LCB-6d28d9?style=flat-square)]()
 [![Guarantee](https://img.shields.io/badge/never-downgrades_blind-c2410c?style=flat-square)]()
 [![Scope](https://img.shields.io/badge/v1-learn_·_recommend_·_apply_·_auto--apply-555?style=flat-square)]()
+[![Advanced](https://img.shields.io/badge/advanced-8_opt--in_modes-6d28d9?style=flat-square)]()
 
 [**Quick start**](#quick-start) ·
 [**How it works**](#how-it-works) ·
@@ -102,6 +103,7 @@ and runs the **CC-TS decision rule** on every recommendation:
 | **Telemetry hook** | records each invocation (Stop / SubagentStop) | `overlay/…/settings.json` + `hooks/capture-invocation.sh` |
 | **Config** | the model roster + shape taxonomy + tolerance classes | `advisor.toml` |
 | **Scheduler** | a gc `order` to run `auto-apply` on a cadence (safe unless armed) | `orders/` + `docs/AUTO-APPLY.md` |
+| **Advanced modes** | 8 opt-in research extensions (conformal · empirical-Bayes · Thompson · continuous · cascade · federation · drift · eval-sched) | `modeladvisor/` · §7.3 |
 
 ## Quick start
 
@@ -147,6 +149,27 @@ Two pure reads and one deliberate write.
 application path, on demand; `auto-apply` automates that sweep across all agents —
 conservatively (never auto-downgrading thin-evidence or `Critical` cells) — and can be
 scheduled with a gc `order`. See [`docs/AUTO-APPLY.md`](docs/AUTO-APPLY.md).
+
+## Advanced modes (opt-in)
+
+The eight extensions the paper designs but v1 deliberately left off ([`docs/DESIGN.md`](docs/DESIGN.md) §7.3)
+now ship — each a self-contained, stdlib-only module behind a **default-off** flag, so the
+conservative v1 rule stays the default and turning one on is a one-line config change. v1
+behavior is byte-identical when they're off.
+
+| Mode | Flag / surface | What it adds |
+|------|----------------|--------------|
+| **Conformal calibration** | `lcb_backend = "conformal"` | distribution-free split-conformal gate bound (rolling `(pred, obs)` buffer) in place of the asymptotic Wilson LCB |
+| **Full hierarchical Bayes** | `pooling = "empirical-bayes"` | a genuine empirical-Bayes Beta-Binomial pooler (method-of-moments hyperprior + evidence-weighted shrinkage); optional `[bayes]` PyMC backend |
+| **Thompson sampling** | `mode = "thompson"` · `advise --thompson --seed N` | seeded per-tier Beta sampling instead of the deterministic rule — still gate- and `Critical`-safe, reproducible per seed |
+| **Continuous quality** | `continuous_quality = true` | graded `q ∈ [0,1]` outcomes (reviewer score / test-pass fraction) feeding the Beta; optional Gaussian (NIG) posterior for unbounded scores |
+| **Critical-path cascade** | `advise --cascade-bead ID` | DAG-propagated effective `N_dep` from the bead dependency graph — an ADR that blocks N builders carries a larger blast radius than a leaf |
+| **Multi-tenant federation** | `[federation]` peers · `advisor federate` | share **aggregates only** (never raw telemetry) across repos to warm thin cells, trust-weighted so local evidence always dominates |
+| **Change-point drift** | `changepoint = true` · `advisor drift` | Page-Hinkley detection of upstream model drift/deprecation + recency re-weighting so the gate re-learns the new regime |
+| **Auto-scheduled eval** | `advisor eval-schedule [--apply]` | rank gating cells by CI-width × unlock-value and dispatch eval probes proportional to posterior width (dry-run default; schedulable via a gc `order`) |
+
+All eight are covered by the suite (228 tests) and never weaken the `Critical`
+never-downgrade guarantee. Math + rationale: [`docs/DESIGN.md`](docs/DESIGN.md) §7.3.
 
 ## Install & uninstall
 
@@ -198,6 +221,7 @@ Everything is config-driven; nothing is hard-coded. Edit `advisor.toml`:
 | `q_tol` / `M` | the per-class quality-loss tolerance + asymmetric multiplier (`∞`/`20`/`5`/`1`) | paper defaults |
 | channel weights | `close:1`, `review:3`, `eval:5` | as shown |
 | `force_baseline` | safety hatch: pin a cell to its baseline, short-circuit all learning | off |
+| advanced modes | 8 opt-in flags — `lcb_backend`, `pooling`, `mode`, `continuous_quality`, `changepoint`, `[federation]` ([Advanced modes](#advanced-modes-opt-in)) | all off |
 
 The pack ships an editable starter (`SAMPLE_TOML`); a consumer with a characterised
 landscape can also supply a `priors.json` for immediate convergence. Full reference:
@@ -219,9 +243,12 @@ Honest about the scope line.
 - **Conservative by design ⇒ it converges deliberately.** A thin cell recommends the
   baseline until evidence accrues (~a couple dozen observations dominate the cold-start
   prior). That is the point, not a defect: it never trades quality for speed of savings.
-- **Eval auto-scheduling is deferred.** v1 *records* the uncertainty trigger and *surfaces*
-  the highest-value eval probe in `inspect`; it does not auto-dispatch eval runs. The
-  conformal-LCB backend (vs the v1 Wilson/Beta-ppf bound) is likewise behind a future flag.
+- **The research extensions ship opt-in.** Every feature the paper designs but v1 left off —
+  conformal calibration, full (empirical-Bayes) hierarchical pooling, Thompson sampling,
+  continuous quality, critical-path cascade, federation, change-point drift, and
+  auto-scheduled eval — is now implemented behind a **default-off** flag
+  ([Advanced modes](#advanced-modes-opt-in)). The conservative deterministic rule remains the
+  default, and enabling any mode never weakens the `Critical` never-downgrade guarantee.
 - **It advises; you decide.** During an incident, pin the baseline (`force_baseline`) and
   don't explore. The advisor never drives routing on its own in v1.
 
