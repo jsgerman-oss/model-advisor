@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/go/bin:$HOME/.local/bin:$PATH\" && bash \"$CLAUDE_PROJECT_DIR/packs/model-advisor/hooks/capture-invocation.sh\""
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/go/bin:$HOME/.local/bin:$PATH\" && bash \"$CLAUDE_PROJECT_DIR/packs/model-advisor/hooks/capture-invocation.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
