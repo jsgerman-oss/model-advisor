@@ -20,9 +20,12 @@
 #                         the [[rigs]] entry whose name matches <name>)
 #      source is recorded relative to the city root (e.g. "packs/model-advisor").
 #   3. --town only: add the "use-model-advisor" discipline fragment to city.toml
-#      global_fragments — only if not already present (no gc-native command
-#      exists for this key, so a backed-up, surgical edit is used; the file is
-#      backed up once per run, only when the fragment actually needs adding).
+#      [agent_defaults] append_fragments — only if not already present (no
+#      gc-native command exists for this key, so a backed-up, surgical edit is
+#      used; the file is backed up once per run, only when the fragment actually
+#      needs adding). The [agent_defaults] table and/or the append_fragments
+#      array are created if absent. (This is the non-deprecated home; the old
+#      top-level global_fragments key is deprecated.)
 #   4. Trigger re-projection with `gc reload` so the claude overlay's
 #      Stop/SubagentStop hook is materialized + merged into projected settings.
 #   5. Verify: `gc lint`, the skill shows in `gc skill list`, the import is
@@ -45,7 +48,7 @@ PACK_NAME="model-advisor"     # import binding name + skill prefix
 IMPORT_NAME="model-advisor"
 # The single discipline prompt-fragment this pack ships. It has a file at
 # template-fragments/<name>.template.md and is wired into city.toml
-# global_fragments on --town scope.
+# [agent_defaults] append_fragments on --town scope.
 FRAGMENTS=("use-model-advisor")
 SKILL_QUALIFIED="${PACK_NAME}.use-model-advisor"
 HOOK_MARKER="model-advisor/hooks/capture-invocation.sh"   # unique substring of our hook command
@@ -173,28 +176,104 @@ sys.exit(1)
 PY
 }
 
-fragment_present() { # 0 if fragment $1 is already in global_fragments
-  grep -Eq "global_fragments[[:space:]]*=.*\"$1\"" "$CITY/city.toml"
+fragment_present() { # 0 if fragment $1 is already in [agent_defaults] append_fragments
+  python3 - "$CITY/city.toml" "$1" <<'PY'
+import sys, re
+path, frag = sys.argv[1], sys.argv[2]
+try:
+    src = open(path).read()
+except OSError:
+    sys.exit(1)
+# Scan only the [agent_defaults] table body for an append_fragments array that
+# already lists `frag`. (global_fragments — the deprecated key — is ignored on
+# purpose: a legacy entry there must NOT mask the need to add the new one.)
+lines = src.splitlines(keepends=True)
+hdr = re.compile(r'^\[agent_defaults\]\s*$')
+start = next((i for i, l in enumerate(lines) if hdr.match(l)), None)
+if start is None:
+    sys.exit(1)
+end = len(lines)
+for j in range(start + 1, len(lines)):
+    if re.match(r'^\[', lines[j]):
+        end = j; break
+body = "".join(lines[start + 1:end])
+m = re.search(r'(?m)^\s*append_fragments\s*=\s*(\[[^\]]*\])', body)
+if not m:
+    sys.exit(1)
+items = [x.strip().strip('"').strip("'") for x in m.group(1)[1:-1].split(',') if x.strip()]
+sys.exit(0 if frag in items else 1)
+PY
 }
 
-edit_fragment() { # add|remove fragment $2 in city.toml global_fragments (idempotent)
+edit_fragment() { # add|remove fragment $2 in [agent_defaults] append_fragments (idempotent)
+  # Surgical, format-preserving text edit of city.toml. The non-deprecated home
+  # for an opt-in discipline fragment is the [agent_defaults] table's
+  # append_fragments array (gc warns that the old top-level global_fragments is
+  # deprecated). We create the [agent_defaults] table and/or the append_fragments
+  # array if absent, and never double-add. Everything outside the edited array /
+  # the one inserted line is preserved byte-for-byte, so add<->remove round-trips.
   python3 - "$CITY/city.toml" "$1" "$2" <<'PY'
 import sys, re
 path, action, frag = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(path).read()
-m = re.search(r'(?m)^(\s*global_fragments\s*=\s*)(\[[^\]]*\])', src)
-if not m:
-    sys.stderr.write("global_fragments key not found in %s\n" % path); sys.exit(3)
-prefix, arr = m.group(1), m.group(2)
-items = [x.strip().strip('"').strip("'") for x in arr[1:-1].split(',') if x.strip()]
+lines = src.splitlines(keepends=True)
+
+def find_table(name):
+    hdr = re.compile(r'^\[%s\]\s*$' % re.escape(name))
+    s = next((i for i, l in enumerate(lines) if hdr.match(l)), None)
+    if s is None:
+        return None, None
+    e = len(lines)
+    for j in range(s + 1, len(lines)):
+        if re.match(r'^\[', lines[j]):
+            e = j; break
+    return s, e
+
+start, end = find_table("agent_defaults")
+
 if action == "add":
-    if frag in items: sys.exit(0)
-    items.append(frag)
-else:  # remove
-    if frag not in items: sys.exit(0)
-    items = [x for x in items if x != frag]
-new = "[" + ", ".join('"%s"' % x for x in items) + "]"
-open(path, "w").write(src[:m.start()] + prefix + new + src[m.end():])
+    if start is None:
+        # No [agent_defaults] table: append one at EOF carrying the array.
+        sep = "" if (src == "" or src.endswith("\n")) else "\n"
+        block = '%s\n[agent_defaults]\nappend_fragments = ["%s"]\n' % (sep, frag)
+        open(path, "w").write(src + block)
+        sys.exit(0)
+    body_lines = lines[start + 1:end]
+    body = "".join(body_lines)
+    m = re.search(r'(?m)^(\s*append_fragments\s*=\s*)(\[[^\]]*\])', body)
+    if m:
+        items = [x.strip().strip('"').strip("'")
+                 for x in m.group(2)[1:-1].split(',') if x.strip()]
+        if frag in items:
+            sys.exit(0)
+        items.append(frag)
+        new_arr = "[" + ", ".join('"%s"' % x for x in items) + "]"
+        new_body = body[:m.start(2)] + new_arr + body[m.end(2):]
+        open(path, "w").write("".join(lines[:start + 1]) + new_body + "".join(lines[end:]))
+        sys.exit(0)
+    # Table exists but no append_fragments array: insert the line right after the
+    # [agent_defaults] header (matching the header's indentation, normally none).
+    insert = 'append_fragments = ["%s"]\n' % frag
+    out = lines[:start + 1] + [insert] + lines[start + 1:]
+    open(path, "w").write("".join(out))
+    sys.exit(0)
+
+# action == remove
+if start is None:
+    sys.exit(0)
+body_lines = lines[start + 1:end]
+body = "".join(body_lines)
+m = re.search(r'(?m)^(\s*append_fragments\s*=\s*)(\[[^\]]*\])', body)
+if not m:
+    sys.exit(0)
+items = [x.strip().strip('"').strip("'")
+         for x in m.group(2)[1:-1].split(',') if x.strip()]
+if frag not in items:
+    sys.exit(0)
+items = [x for x in items if x != frag]
+new_arr = "[" + ", ".join('"%s"' % x for x in items) + "]"
+new_body = body[:m.start(2)] + new_arr + body[m.end(2):]
+open(path, "w").write("".join(lines[:start + 1]) + new_body + "".join(lines[end:]))
 PY
 }
 
@@ -304,27 +383,29 @@ else
   fi
 fi
 
-# ---- step 3: global fragments (town only) ----------------------------------
-# Add the pack's discipline fragment to city.toml global_fragments, skipping it
-# if already present (idempotent). The file is backed up at most once per run,
-# and only when the fragment actually needs adding — never under --dry-run, and
-# never when it is already in place.
-step "3/5  prompt fragment (global_fragments)"
+# ---- step 3: agent_defaults append_fragments (town only) -------------------
+# Add the pack's discipline fragment to city.toml [agent_defaults]
+# append_fragments (the non-deprecated home), skipping it if already present
+# (idempotent). The [agent_defaults] table / the append_fragments array are
+# created if absent. The file is backed up at most once per run, and only when
+# the fragment actually needs adding — never under --dry-run, and never when it
+# is already in place.
+step "3/5  prompt fragment ([agent_defaults] append_fragments)"
 if [ "$SCOPE" = "town" ]; then
   backed_up=0
   for frag in "${FRAGMENTS[@]}"; do
     if fragment_present "$frag"; then
-      info "\"$frag\" already in global_fragments — no-op"
+      info "\"$frag\" already in [agent_defaults] append_fragments — no-op"
     elif [ "$DRY_RUN" -eq 1 ]; then
-      info "[dry-run] add \"$frag\" to global_fragments in $CITY/city.toml"
+      info "[dry-run] add \"$frag\" to [agent_defaults] append_fragments in $CITY/city.toml"
     else
       if [ "$backed_up" -eq 0 ]; then backup_file "$CITY/city.toml"; backed_up=1; fi
       edit_fragment add "$frag"
-      info "added \"$frag\" to global_fragments"
+      info "added \"$frag\" to [agent_defaults] append_fragments"
     fi
   done
 else
-  info "rig scope: global_fragments is city-wide and not touched"
+  info "rig scope: append_fragments is city-wide and not touched"
   info "(the rig's agents still get the skill + telemetry hook from the import)"
 fi
 
@@ -387,7 +468,7 @@ fi
 # 5d. fragment (town only) — must be present
 if [ "$SCOPE" = "town" ]; then
   for frag in "${FRAGMENTS[@]}"; do
-    if fragment_present "$frag"; then info "fragment: \"$frag\" in global_fragments"; else info "fragment: \"$frag\" MISSING"; fail=1; fi
+    if fragment_present "$frag"; then info "fragment: \"$frag\" in [agent_defaults] append_fragments"; else info "fragment: \"$frag\" MISSING"; fail=1; fi
   done
 fi
 

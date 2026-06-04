@@ -970,17 +970,31 @@ def resolve_agent_config(
 ) -> ConfigTarget:
     """Locate the gc config file + scope that owns ``agent``'s model field.
 
+    The non-deprecated home for an agent's routing fields (``provider`` /
+    ``model`` / ``run_target``) is the **per-agent flat
+    ``agents/<agent>/agent.toml``** (gc warns that ``[workspace] provider`` is
+    deprecated → "set provider per agent in ``agents/<name>/agent.toml``", and
+    likewise resolves ``model`` per agent there). So resolution prefers — and,
+    when absent, **creates** — that flat file rather than writing into
+    ``city.toml``'s ``[workspace]`` / ``[[agent]]`` blocks.
+
     Resolution (first hit wins):
 
     1. ``$ADVISOR_AGENT_TOML`` — explicit file override (used by tests). If it
        contains an ``[[agent]]`` block named ``agent`` we target that; if it has
        an ``[agent_defaults]`` table we target that; otherwise it is treated as
-       a flat per-agent ``agent.toml``.
-    2. A flat ``<city>/.gc/system/packs/<rig?>/agents/<agent>/agent.toml`` (the
-       gastown layout). ``city`` defaults to ``$GC_CITY`` / cwd; ``rig`` narrows
-       the pack search.
-    3. A ``[[agent]] name = "<agent>"`` block, or an ``[agent_defaults]`` table,
-       inside ``<city>/city.toml``.
+       a flat per-agent ``agent.toml``. (Honored verbatim — the caller named the
+       exact file, so we never redirect it to a created path.)
+    2. An **existing** flat ``<city>/.gc/system/packs/<rig?>/agents/<agent>/
+       agent.toml`` (the gastown layout). ``city`` defaults to ``$GC_CITY`` /
+       cwd; ``rig`` narrows the pack search.
+    3. If none exists, **create** a flat ``agents/<agent>/agent.toml`` at the
+       canonical pack root (the ``--rig`` pack if given, else the first
+       agent-bearing pack under ``.gc/system/packs``) and target it. This is the
+       non-deprecated per-agent home, materialized to match gc's convention.
+    4. Only if there is no ``.gc/system/packs`` at all do we fall back to a
+       ``[[agent]] name = "<agent>"`` block / ``[agent_defaults]`` table inside
+       ``<city>/city.toml``.
 
     Raises :class:`ConfigResolveError` if nothing resolves.
     """
@@ -994,8 +1008,7 @@ def resolve_agent_config(
 
     city = city or os.environ.get("GC_CITY") or os.getcwd()
 
-    # (2) flat gastown agent.toml — search common pack roots.
-    candidates = []
+    # (2) EXISTING flat gastown agent.toml — search common pack roots.
     pack_roots = []
     sys_packs = os.path.join(city, ".gc", "system", "packs")
     if rig:
@@ -1006,12 +1019,29 @@ def resolve_agent_config(
             if os.path.isdir(p) and p not in pack_roots:
                 pack_roots.append(p)
     for root in pack_roots:
-        candidates.append(os.path.join(root, "agents", agent, "agent.toml"))
-    for cand in candidates:
+        cand = os.path.join(root, "agents", agent, "agent.toml")
         if os.path.exists(cand):
             return ConfigTarget(path=cand, kind="flat", agent=agent)
 
-    # (3) city.toml [[agent]] / [agent_defaults]
+    # (3) No existing per-agent file: CREATE the canonical flat
+    #     agents/<agent>/agent.toml (the non-deprecated home gc reads) rather
+    #     than writing the routing fields into city.toml's [workspace]/[[agent]]
+    #     (deprecated). Pick the creation pack root: the --rig pack if given,
+    #     else the first pack that already carries an agents/ dir (a real
+    #     agent-bearing pack like gastown — not bd/dolt/core), else the first
+    #     pack root. Materialize an empty file (+ parent dirs) so the downstream
+    #     read/backup/write path works unchanged (current model reads as unset).
+    create_root = _pick_creation_pack_root(pack_roots, rig, sys_packs)
+    if create_root is not None:
+        new_path = os.path.join(create_root, "agents", agent, "agent.toml")
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        if not os.path.exists(new_path):
+            with open(new_path, "w", encoding="utf-8") as fh:
+                fh.write("")  # empty flat agent.toml; set_field inserts the keys
+        return ConfigTarget(path=new_path, kind="flat", agent=agent)
+
+    # (4) Last resort (no .gc/system/packs at all): city.toml [[agent]] /
+    #     [agent_defaults]. Only reached on a city without a packs tree.
     city_toml = os.path.join(city, "city.toml")
     if os.path.exists(city_toml):
         try:
@@ -1025,6 +1055,32 @@ def resolve_agent_config(
         f"[agent_defaults] block in {city_toml}. "
         "Set ADVISOR_AGENT_TOML or pass --city/--rig."
     )
+
+
+def _pick_creation_pack_root(
+    pack_roots: Sequence[str], rig: Optional[str], sys_packs: str
+) -> Optional[str]:
+    """Choose the pack root under which to create a new ``agents/<agent>/agent.toml``.
+
+    Preference order:
+      1. The ``--rig`` pack root, when ``rig`` was given and it exists on disk
+         (the operator scoped the apply to that rig).
+      2. The first pack root that already carries an ``agents/`` directory — i.e.
+         a real agent-bearing pack (``gastown``), not an infra pack
+         (``bd`` / ``dolt`` / ``core``) that holds no agents.
+      3. The first pack root, if any.
+
+    Returns ``None`` only when there are no pack roots at all (no
+    ``.gc/system/packs`` tree), which routes the caller to the city.toml fallback.
+    """
+    if rig:
+        rig_root = os.path.join(sys_packs, rig)
+        if os.path.isdir(rig_root):
+            return rig_root
+    for root in pack_roots:
+        if os.path.isdir(os.path.join(root, "agents")):
+            return root
+    return pack_roots[0] if pack_roots else None
 
 
 def _classify_config_file(

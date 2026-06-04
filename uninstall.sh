@@ -6,8 +6,10 @@
 #
 # Reverses, in order:
 #   1. Remove the "use-model-advisor" discipline fragment from city.toml
-#      global_fragments (--town only); removed only if present (idempotent), and
-#      the file is backed up once.
+#      [agent_defaults] append_fragments (--town only); removed only if present
+#      (idempotent), and the file is backed up once. For a clean reversal of an
+#      OLD install, any legacy top-level global_fragments entry (the deprecated
+#      key) is stripped in the same pass.
 #   2. Remove the pack import. It is a DIRECT config entry (the gastown pattern,
 #      not `gc import add`/`remove`), so a surgical, backed-up edit drops it:
 #        --town       -> drops  <city>/pack.toml   [imports.model-advisor]
@@ -34,7 +36,8 @@ PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACK_NAME="model-advisor"
 IMPORT_NAME="model-advisor"
 # The single discipline prompt-fragment this pack ships; mirror of install.sh.
-# Removed from city.toml global_fragments on --town scope.
+# Removed from city.toml [agent_defaults] append_fragments on --town scope (and,
+# for an old install, from the legacy top-level global_fragments too).
 FRAGMENTS=("use-model-advisor")
 HOOK_MARKER="model-advisor/hooks/capture-invocation.sh"
 
@@ -127,21 +130,91 @@ sys.exit(1)
 PY
 }
 
-fragment_present() { grep -Eq "global_fragments[[:space:]]*=.*\"$1\"" "$CITY/city.toml"; }
+fragment_present() { # 0 if fragment $1 is in [agent_defaults] append_fragments OR legacy global_fragments
+  # Checks BOTH homes so verify catches a leftover wherever a current-or-old
+  # install put it: the new [agent_defaults] append_fragments array, or the
+  # deprecated top-level global_fragments key.
+  python3 - "$CITY/city.toml" "$1" <<'PY'
+import sys, re
+path, frag = sys.argv[1], sys.argv[2]
+try:
+    src = open(path).read()
+except OSError:
+    sys.exit(1)
+lines = src.splitlines(keepends=True)
 
-edit_fragment_remove() { # remove fragment $1 from city.toml global_fragments (idempotent)
+# legacy top-level global_fragments (anywhere in the file)
+m = re.search(r'(?m)^\s*global_fragments\s*=\s*(\[[^\]]*\])', src)
+if m:
+    items = [x.strip().strip('"').strip("'") for x in m.group(1)[1:-1].split(',') if x.strip()]
+    if frag in items:
+        sys.exit(0)
+
+# new home: [agent_defaults] append_fragments (scan only that table body)
+hdr = re.compile(r'^\[agent_defaults\]\s*$')
+start = next((i for i, l in enumerate(lines) if hdr.match(l)), None)
+if start is not None:
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r'^\[', lines[j]):
+            end = j; break
+    body = "".join(lines[start + 1:end])
+    am = re.search(r'(?m)^\s*append_fragments\s*=\s*(\[[^\]]*\])', body)
+    if am:
+        items = [x.strip().strip('"').strip("'") for x in am.group(1)[1:-1].split(',') if x.strip()]
+        if frag in items:
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+edit_fragment_remove() { # remove fragment $1 from BOTH append_fragments and legacy global_fragments (idempotent)
+  # Mirror of install.sh's edit_fragment add. Surgical, format-preserving: drops
+  # the fragment from the [agent_defaults] append_fragments array (the new home)
+  # AND from any legacy top-level global_fragments array (so an OLD install, which
+  # wrote the deprecated key, still reverses cleanly). Everything outside the
+  # edited array(s) is preserved byte-for-byte.
   python3 - "$CITY/city.toml" "$1" <<'PY'
 import sys, re
 path, frag = sys.argv[1], sys.argv[2]
 src = open(path).read()
-m = re.search(r'(?m)^(\s*global_fragments\s*=\s*)(\[[^\]]*\])', src)
-if not m: sys.exit(0)
-prefix, arr = m.group(1), m.group(2)
-items = [x.strip().strip('"').strip("'") for x in arr[1:-1].split(',') if x.strip()]
-if frag not in items: sys.exit(0)
-items = [x for x in items if x != frag]
-new = "[" + ", ".join('"%s"' % x for x in items) + "]"
-open(path, "w").write(src[:m.start()] + prefix + new + src[m.end():])
+
+def drop_from_array(text, array_re, lo=0, hi=None):
+    """Remove `frag` from the first array matched by array_re within [lo, hi)."""
+    hi = len(text) if hi is None else hi
+    region = text[lo:hi]
+    m = array_re.search(region)
+    if not m:
+        return text, False
+    items = [x.strip().strip('"').strip("'") for x in m.group(2)[1:-1].split(',') if x.strip()]
+    if frag not in items:
+        return text, False
+    items = [x for x in items if x != frag]
+    new_arr = "[" + ", ".join('"%s"' % x for x in items) + "]"
+    a0, a1 = lo + m.start(2), lo + m.end(2)
+    return text[:a0] + new_arr + text[a1:], True
+
+# 1) legacy top-level global_fragments, anywhere.
+src, _ = drop_from_array(src, re.compile(r'(?m)^(\s*global_fragments\s*=\s*)(\[[^\]]*\])'))
+
+# 2) [agent_defaults] append_fragments — scope to that table body so we never
+#    touch an append_fragments under some other table.
+lines = src.splitlines(keepends=True)
+hdr = re.compile(r'^\[agent_defaults\]\s*$')
+start = next((i for i, l in enumerate(lines) if hdr.match(l)), None)
+if start is not None:
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r'^\[', lines[j]):
+            end = j; break
+    body_lo = len("".join(lines[:start + 1]))
+    body_hi = len("".join(lines[:end]))
+    src, _ = drop_from_array(
+        src, re.compile(r'(?m)^(\s*append_fragments\s*=\s*)(\[[^\]]*\])'),
+        lo=body_lo, hi=body_hi,
+    )
+
+open(path, "w").write(src)
 PY
 }
 
@@ -259,28 +332,29 @@ strip_hook() {
 }
 
 # ---- step 1: fragments (town only) -----------------------------------------
-# Remove the pack's discipline fragment from city.toml global_fragments, skipping
-# it if already absent (idempotent). The file is backed up at most once per run,
-# and only when the fragment actually needs removing — never under --dry-run, and
-# never when it is not present.
-step "1/5  prompt fragment (global_fragments)"
+# Remove the pack's discipline fragment from city.toml [agent_defaults]
+# append_fragments (and any legacy global_fragments entry an old install left),
+# skipping it if already absent (idempotent). The file is backed up at most once
+# per run, and only when the fragment actually needs removing — never under
+# --dry-run, and never when it is not present.
+step "1/5  prompt fragment ([agent_defaults] append_fragments)"
 if [ "$SCOPE" = "town" ]; then
   backed_up=0
   for frag in "${FRAGMENTS[@]}"; do
     if fragment_present "$frag"; then
       if [ "$DRY_RUN" -eq 1 ]; then
-        info "[dry-run] remove \"$frag\" from global_fragments"
+        info "[dry-run] remove \"$frag\" from append_fragments (and legacy global_fragments)"
       else
         if [ "$backed_up" -eq 0 ]; then backup_file "$CITY/city.toml"; backed_up=1; fi
         edit_fragment_remove "$frag"
-        info "removed \"$frag\" from global_fragments"
+        info "removed \"$frag\" from append_fragments (and legacy global_fragments)"
       fi
     else
-      info "\"$frag\" not in global_fragments — no-op"
+      info "\"$frag\" not in append_fragments / global_fragments — no-op"
     fi
   done
 else
-  info "rig scope: global_fragments not touched"
+  info "rig scope: append_fragments not touched"
 fi
 
 # ---- step 2: import --------------------------------------------------------
@@ -367,7 +441,7 @@ fail=0
 if import_present; then info "import: STILL REGISTERED ($IMPORT_NAME)"; fail=1; else info "import: removed"; fi
 if [ "$SCOPE" = "town" ]; then
   for frag in "${FRAGMENTS[@]}"; do
-    if fragment_present "$frag"; then info "fragment: \"$frag\" STILL PRESENT"; fail=1; else info "fragment: \"$frag\" removed"; fi
+    if fragment_present "$frag"; then info "fragment: \"$frag\" STILL PRESENT (append_fragments / global_fragments)"; fail=1; else info "fragment: \"$frag\" removed"; fi
   done
 fi
 leftover=0

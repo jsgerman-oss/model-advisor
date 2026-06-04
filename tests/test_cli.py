@@ -615,6 +615,142 @@ def test_set_tier_fields_is_byte_preserving_and_idempotent(tmp_path):
     assert once.count("run_target = ") == 1
 
 
+# --------------------------------------------------------------------------- #
+# apply — the non-deprecated target: per-agent agents/<name>/agent.toml.
+#
+# gc deprecates `[workspace] provider` ("set provider per agent in
+# agents/<name>/agent.toml") and resolves `model` per agent there too.  These
+# tests pin that the apply path resolves to (and, when absent, CREATES) the flat
+# per-agent `.gc/system/packs/<pack>/agents/<agent>/agent.toml` — and NEVER
+# writes the routing fields into city.toml's [workspace]/[[agent]].  Unlike the
+# tests above (which set $ADVISOR_AGENT_TOML to a literal file), these drive the
+# real city-tree resolution via --city, so a regression that reroutes the write
+# back to city.toml is caught.
+# --------------------------------------------------------------------------- #
+
+def _make_city_tree(tmp_path, *, existing_agents=("polecat",),
+                    extra_packs=("bd", "dolt"), agent_pack="gastown",
+                    city_toml=None):
+    """Build a synthetic city: an agent-bearing pack + infra packs + city.toml."""
+    city = tmp_path / "city"
+    pack_agents = city / ".gc" / "system" / "packs" / agent_pack / "agents"
+    for a in existing_agents:
+        (pack_agents / a).mkdir(parents=True, exist_ok=True)
+        (pack_agents / a / "agent.toml").write_text(
+            'scope = "rig"\nidle_timeout = "2h"\n', encoding="utf-8"
+        )
+    for p in extra_packs:  # infra packs that carry no agents/ dir
+        (city / ".gc" / "system" / "packs" / p).mkdir(parents=True, exist_ok=True)
+    ct = city / "city.toml"
+    ct.write_text(
+        city_toml
+        if city_toml is not None
+        else '[workspace]\nprovider = "claude"\n\n'
+             '[[agent]]\nname = "refinery"\nscope = "rig"\n',
+        encoding="utf-8",
+    )
+    return city
+
+
+def test_apply_targets_existing_per_agent_agent_toml(monkeypatch, tmp_path):
+    """An existing flat agents/<agent>/agent.toml is the target (not city.toml)."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    monkeypatch.delenv("ADVISOR_AGENT_TOML", raising=False)
+    city = _make_city_tree(tmp_path, existing_agents=("polecat",))
+    city_before = (city / "city.toml").read_text()
+
+    rc, text = _run("apply", "polecat", "--shape", "implement", "--city", str(city))
+    assert rc == 0
+    flat = city / ".gc" / "system" / "packs" / "gastown" / "agents" / "polecat" / "agent.toml"
+    # the resolved config IS the per-agent flat file
+    assert str(flat) in text
+    updated = flat.read_text()
+    assert 'provider = "codex"' in updated
+    assert 'model = "gpt-5.4"' in updated
+    assert 'run_target = "codex-gpt54"' in updated
+    assert 'scope = "rig"' in updated  # original key preserved
+    # city.toml was never touched (the deprecated home stays clean)
+    assert (city / "city.toml").read_text() == city_before
+
+
+def test_apply_creates_per_agent_agent_toml_when_absent(monkeypatch, tmp_path):
+    """No flat file → CREATE agents/<agent>/agent.toml; city.toml stays byte-identical."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    monkeypatch.delenv("ADVISOR_AGENT_TOML", raising=False)
+    # 'refinery' has an [[agent]] block in city.toml but NO flat agent.toml yet.
+    city = _make_city_tree(tmp_path, existing_agents=("polecat",))
+    city_before = (city / "city.toml").read_text()
+    created = city / ".gc" / "system" / "packs" / "gastown" / "agents" / "refinery" / "agent.toml"
+    assert not created.exists()
+
+    rc, text = _run("apply", "refinery", "--shape", "implement", "--city", str(city))
+    assert rc == 0
+    # the per-agent flat file was created under the agent-bearing pack (gastown),
+    # NOT under an infra pack (bd/dolt), and the triple landed there.
+    assert created.exists()
+    assert str(created) in text
+    d = created.read_text()
+    assert 'provider = "codex"' in d
+    assert 'model = "gpt-5.4"' in d
+    assert 'run_target = "codex-gpt54"' in d
+    # the DEPRECATED location (city.toml [workspace]/[[agent]]) is untouched.
+    assert (city / "city.toml").read_text() == city_before
+
+
+def test_apply_create_honors_rig_pack_root(monkeypatch, tmp_path):
+    """--rig selects that rig's pack root for the created per-agent agent.toml."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    monkeypatch.delenv("ADVISOR_AGENT_TOML", raising=False)
+    city = _make_city_tree(tmp_path, existing_agents=("polecat",))
+    # a rig pack with no agents/ dir yet — --rig must still target it.
+    (city / ".gc" / "system" / "packs" / "whiskeyshop").mkdir(parents=True)
+
+    rc, text = _run(
+        "apply", "newbie", "--shape", "implement",
+        "--city", str(city), "--rig", "whiskeyshop",
+    )
+    assert rc == 0
+    created = (
+        city / ".gc" / "system" / "packs" / "whiskeyshop"
+        / "agents" / "newbie" / "agent.toml"
+    )
+    assert created.exists()
+    assert str(created) in text
+    assert 'model = "gpt-5.4"' in created.read_text()
+
+
+def test_apply_per_agent_create_is_idempotent_noop(monkeypatch, tmp_path):
+    """Second apply after a create is the no-op refusal (model already set)."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    monkeypatch.delenv("ADVISOR_AGENT_TOML", raising=False)
+    city = _make_city_tree(tmp_path, existing_agents=("polecat",))
+
+    rc1, _ = _run("apply", "refinery", "--shape", "implement", "--city", str(city))
+    assert rc1 == 0
+    created = city / ".gc" / "system" / "packs" / "gastown" / "agents" / "refinery" / "agent.toml"
+    after_first = created.read_text()
+    assert after_first.count("model = ") == 1
+
+    rc2, text2 = _run("apply", "refinery", "--shape", "implement", "--city", str(city))
+    assert rc2 == 3
+    assert "refused" in text2.lower()
+    assert created.read_text() == after_first  # unchanged on the refusal
+
+
+def test_resolve_agent_config_prefers_created_flat_over_city_toml(monkeypatch, tmp_path):
+    """Unit: resolver returns a flat ConfigTarget under packs, never agent_block."""
+    monkeypatch.delenv("ADVISOR_AGENT_TOML", raising=False)
+    city = _make_city_tree(tmp_path, existing_agents=("polecat",))
+    target = cli.resolve_agent_config("refinery", city=str(city))
+    assert target.kind == "flat"
+    assert target.path.endswith(
+        os.path.join("gastown", "agents", "refinery", "agent.toml")
+    )
+    # span is None for a flat target (whole-file scope) — not a city.toml table.
+    assert target.span is None
+    assert "city.toml" not in target.path
+
+
 @real_engine
 def test_real_apply_lifecycle_on_temp_config(monkeypatch, tmp_path):
     # full apply lifecycle against the real engine, on a TEMP flat agent.toml.
