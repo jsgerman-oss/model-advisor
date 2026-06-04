@@ -21,32 +21,88 @@ baseline_tier = "opus"
 # Roster — the user's cost-ordered model tiers. rank 1 = cheapest.            #
 # in_cost / out_cost are $/MTok (illustrative; replace with your rate sheet). #
 # --------------------------------------------------------------------------- #
+# Mixed Claude + Codex roster, cost-ordered (rank 1 = cheapest). Codex costs are
+# ESTIMATES — replace all in_cost/out_cost with your real $/MTok rate sheet. Codex
+# tiers run at each model's DEFAULT reasoning effort until gc forwards an effort
+# flag (see the Phase-2 block below); `run_target` is the gc session config the
+# advisor's apply points the agent at (Codex run targets must exist — see README).
+[[tier]]
+id         = "spark"
+provider   = "codex"
+model      = "gpt-5.3-codex-spark"   # ultra-fast coding (128k ctx)
+run_target = "codex-spark"
+rank       = 1
+in_cost    = 0.50
+out_cost   = 2.00
+
+[[tier]]
+id         = "mini"
+provider   = "codex"
+model      = "gpt-5.4-mini"          # small / fast / cost-efficient (272k ctx)
+run_target = "codex-mini"
+rank       = 2
+in_cost    = 0.70
+out_cost   = 3.00
+
 [[tier]]
 id         = "haiku"
 provider   = "claude"
 model      = "claude-haiku-4-5"
 run_target = "claude-haiku"
-rank       = 1
+rank       = 3
 in_cost    = 0.80
 out_cost   = 4.00
+
+[[tier]]
+id         = "gpt54"
+provider   = "codex"
+model      = "gpt-5.4"               # strong everyday coding (272k ctx)
+run_target = "codex-gpt54"
+rank       = 4
+in_cost    = 2.50
+out_cost   = 10.00
 
 [[tier]]
 id         = "sonnet"
 provider   = "claude"
 model      = "claude-sonnet-4-5"
 run_target = "claude-sonnet"
-rank       = 2
+rank       = 5
 in_cost    = 3.00
 out_cost   = 15.00
+
+[[tier]]
+id         = "gpt55"
+provider   = "codex"
+model      = "gpt-5.5"               # frontier: complex coding / research (272k ctx)
+run_target = "codex-gpt55"
+rank       = 6
+in_cost    = 8.00
+out_cost   = 30.00
 
 [[tier]]
 id         = "opus"
 provider   = "claude"
 model      = "claude-opus-4-8"
 run_target = "claude-opus"
-rank       = 3
+rank       = 7
 in_cost    = 15.00
 out_cost   = 75.00
+
+# --------------------------------------------------------------------------- #
+# PHASE 2 — reasoning effort as tiers (your chosen design). gc has NO effort   #
+# config path today, so gpt-5.5-low and gpt-5.5-high would run identically     #
+# until a gc-core seam forwards `reasoning` to the Codex CLI. Once that lands,  #
+# uncomment these (and adjust ranks), and the engine will learn per-effort.    #
+# `codex-auto-review` (Codex's auto-approval review model) is omitted from the #
+# general roster — add it as a review-shape tier only if you dispatch it.      #
+# --------------------------------------------------------------------------- #
+# [[tier]]
+#   id = "gpt55-low"  ; provider = "codex" ; model = "gpt-5.5" ; reasoning = "low"
+#   run_target = "codex-gpt55-low"  ; rank = 6 ; in_cost = 8.00  ; out_cost = 30.00
+# [[tier]]
+#   id = "gpt55-high" ; provider = "codex" ; model = "gpt-5.5" ; reasoning = "high"
+#   run_target = "codex-gpt55-high" ; rank = 8 ; in_cost = 12.00 ; out_cost = 48.00
 
 # --------------------------------------------------------------------------- #
 # Tolerance classes — max allowable quality drop (q_tol) + asymmetric         #
