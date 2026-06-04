@@ -32,6 +32,12 @@ from typing import Iterable, Iterator, Mapping
 
 from modeladvisor.config import AdvisorConfig
 
+# ``conformal`` only references ``Cell`` under TYPE_CHECKING, so importing it here
+# is cycle-free. ``hierarchical`` and ``changepoint`` are imported lazily inside the
+# methods that use them (hierarchical imports ``store`` at module load, so a
+# top-level import here would be a cycle).
+from modeladvisor.conformal import CalibrationBuffer
+
 CELL_KEY_SEP = "::"
 
 
@@ -61,6 +67,10 @@ class Cell:
     b: float
     n: int = 0
     last_update: str | None = None
+    #: Optional rolling split-conformal calibration buffer (DESIGN §5.2 / §7.3).
+    #: Only populated when ``cfg.lcb_backend == 'conformal'``; ``None`` otherwise so
+    #: the default path neither grows buffers nor changes the persisted cache shape.
+    calib: CalibrationBuffer | None = None
 
     # ---- moments (DESIGN §1.3) ------------------------------------------- #
 
@@ -86,15 +96,23 @@ class Cell:
             self.last_update = ts
 
     def to_dict(self) -> dict:
-        return {"a": self.a, "b": self.b, "n": self.n, "last_update": self.last_update}
+        d = {"a": self.a, "b": self.b, "n": self.n, "last_update": self.last_update}
+        # Only emit the buffer when it carries data, so a cell without conformal
+        # calibration serialises byte-identically to v1 (the cache invariant).
+        if self.calib is not None and len(self.calib) > 0:
+            d["calib"] = self.calib.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: Mapping) -> "Cell":
+        calib_raw = d.get("calib")
+        calib = CalibrationBuffer.from_dict(calib_raw) if calib_raw else None
         return cls(
             a=float(d["a"]),
             b=float(d["b"]),
             n=int(d.get("n", 0)),
             last_update=d.get("last_update"),
+            calib=calib,
         )
 
 
@@ -216,6 +234,11 @@ class CellStore:
         source of truth; ``advisor-cells.json`` is merely a cache of the result.
         Missing / empty file ⇒ a pure cold-start store. Malformed lines are
         skipped (the log is append-only and may be partially written).
+
+        When ``cfg.hp.changepoint`` is set, the replay uses a change-point-aware
+        re-fold (:meth:`_apply_records_changepoint`, DESIGN §7.3) that down-weights
+        stale pre-drift evidence; the default (off) path is the straight in-order
+        fold of v1, byte-for-byte unchanged.
         """
         store = cls.cold_start(cfg, priors)
         if jsonl_path is None:
@@ -224,7 +247,10 @@ class CellStore:
         if not os.path.exists(p):
             return store
         with open(p, "r", encoding="utf-8") as fh:
-            store.apply_records(_iter_jsonl(fh))
+            if cfg.hp.changepoint:
+                store._apply_records_changepoint(_iter_jsonl(fh))
+            else:
+                store.apply_records(_iter_jsonl(fh))
         return store
 
     @classmethod
@@ -289,15 +315,39 @@ class CellStore:
             qf = float(q)
         except (TypeError, ValueError):
             return False
-        if qf not in (0.0, 1.0):
+
+        # Quality-signal admission (DESIGN §1.1 / §7.3). Default: strict Bernoulli
+        # ``{0, 1}`` (v1 — drops anything else). With ``continuous_quality`` on, the
+        # full unit interval ``[0, 1]`` is accepted (a reviewer score / test-pass
+        # fraction) and applied via the fractional-count update; the ``{0, 1}`` path
+        # stays byte-identical (``continuous.apply_continuous`` is a strict superset).
+        continuous = self.cfg.hp.continuous_quality
+        from modeladvisor import continuous as _continuous
+
+        if not _continuous.is_valid_q(qf, continuous=continuous):
             return False
+
         w = rec.get("weight")
         if w is None:
             w = self._channel_weight(str(rec.get("channel", "close")))
         else:
             w = float(w)
         ts = rec.get("ts")
-        self.get(str(key)).update(qf, w, ts if ts is None else str(ts))
+        ts = ts if ts is None else str(ts)
+        cell = self.get(str(key))
+
+        # Conformal calibration (DESIGN §5.2 / §7.3): record the (predicted, observed)
+        # pair BEFORE the update so ``pred`` is the cell's mean at decision time. Only
+        # when the conformal backend is selected — we never grow buffers when unused.
+        if self.cfg.lcb_backend == "conformal":
+            if cell.calib is None:
+                cell.calib = CalibrationBuffer()
+            cell.calib.append(cell.mean, qf)
+
+        if continuous:
+            _continuous.apply_continuous(cell, qf, w, ts)
+        else:
+            cell.update(qf, w, ts)
         return True
 
     def _channel_weight(self, channel: str) -> float:
@@ -305,6 +355,78 @@ class CellStore:
         return {"close": hp.w_close, "review": hp.w_review, "eval": hp.w_eval}.get(
             channel, hp.w_close
         )
+
+    # ---- change-point-aware replay (DESIGN §7.3, gated) ------------------- #
+
+    def _apply_records_changepoint(self, records: Iterable[Mapping]) -> int:
+        """Replay quality records with change-point recency re-weighting (§7.3).
+
+        The change-point branch of :meth:`rebuild` (only reached when
+        ``cfg.hp.changepoint`` is set). Instead of folding each observation straight
+        in, it (1) buffers the ordered ``(q, w, ts)`` per cell, (2) runs
+        :func:`changepoint.detect_changepoints` on each cell's time-ordered ``q``
+        stream, then (3) re-folds the cell *from its fresh prior*, multiplying each
+        observation's weight by the matching :func:`changepoint.recency_weights`
+        entry — so evidence before the most recent upstream shift is forgotten and
+        the posterior re-learns the current regime.
+
+        Returns the number of quality records applied (matching
+        :meth:`apply_records`). Honours ``continuous_quality`` and the conformal
+        calibration buffer exactly as :meth:`apply_quality` does, so toggling those
+        on alongside ``changepoint`` composes correctly.
+        """
+        from modeladvisor import changepoint as _changepoint
+        from modeladvisor import continuous as _continuous
+
+        # 1. Buffer ordered (q, w, ts) per cell from the quality stream.
+        per_cell: dict[str, list[tuple[float, float, str | None]]] = {}
+        applied = 0
+        for rec in records:
+            if not isinstance(rec, Mapping):
+                continue
+            if rec.get("kind") != "quality":
+                continue
+            key = rec.get("cell_key")
+            if not key:
+                continue
+            q = rec.get("q")
+            if q is None:
+                continue
+            try:
+                qf = float(q)
+            except (TypeError, ValueError):
+                continue
+            if not _continuous.is_valid_q(qf, continuous=self.cfg.hp.continuous_quality):
+                continue
+            w = rec.get("weight")
+            if w is None:
+                w = self._channel_weight(str(rec.get("channel", "close")))
+            else:
+                w = float(w)
+            ts = rec.get("ts")
+            ts = ts if ts is None else str(ts)
+            per_cell.setdefault(str(key), []).append((qf, w, ts))
+            applied += 1
+
+        # 2+3. Per cell: detect change-points, derive recency weights, re-fold.
+        continuous = self.cfg.hp.continuous_quality
+        conformal = self.cfg.lcb_backend == "conformal"
+        for key, obs in per_cell.items():
+            cell = self.get(str(key))  # fresh prior cell (rebuild starts cold)
+            qs = [o[0] for o in obs]
+            cps = _changepoint.detect_changepoints(qs)
+            rweights = _changepoint.recency_weights(len(obs), cps)
+            for (qf, w, ts), rw in zip(obs, rweights):
+                if conformal:
+                    if cell.calib is None:
+                        cell.calib = CalibrationBuffer()
+                    cell.calib.append(cell.mean, qf)
+                eff_w = w * rw
+                if continuous:
+                    _continuous.apply_continuous(cell, qf, eff_w, ts)
+                else:
+                    cell.update(qf, eff_w, ts)
+        return applied
 
     # ---- hierarchical capped pooling (DESIGN §1.3) ------------------------ #
 
@@ -320,7 +442,17 @@ class CellStore:
         for more), scale the whole pooled contribution by ``pool_lambda ≤ 0.5``,
         and normalise so the pooled pseudocount mass never exceeds ``pool_lambda ×
         own (a + b)``. This keeps own-cell evidence dominant (DESIGN §1.3 cap).
+
+        When ``cfg.pooling == 'empirical-bayes'`` this delegates to the genuine
+        hierarchical Beta-Binomial empirical-Bayes pooler (``hierarchical.eb_pooled``,
+        DESIGN §7.3) — a drop-in replacement; the default ``closed-form`` path below
+        is byte-identical to v1.
         """
+        if self.cfg.pooling == "empirical-bayes":
+            from modeladvisor import hierarchical as _hierarchical
+
+            return _hierarchical.eb_pooled(self, provider, agent, shape, tier_id)
+
         own = self.get(cell_key(provider, agent, shape, tier_id))
         lam = self.cfg.hp.pool_lambda
         if lam <= 0.0:

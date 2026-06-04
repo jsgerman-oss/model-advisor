@@ -129,6 +129,19 @@ class Hyperparams:
     rep_tok_in: float = 1200.0
     rep_tok_out: float = 400.0
 
+    # --- v3 deferred-feature toggles (DESIGN §7.3; all default to v1 behaviour) ---
+    #: Accept a continuous quality signal ``q ∈ [0, 1]`` (reviewer score / test-pass
+    #: fraction) instead of the strict Bernoulli ``{0, 1}`` (``continuous.py``). Off
+    #: ⇒ the binary path is byte-identical to v1.
+    continuous_quality: bool = False
+    #: Decision mode: ``"lcb"`` (the v1 deterministic LCB rule) or ``"thompson"``
+    #: (genuine seeded Thompson sampling — ``thompson.py``). Off ⇒ v1 byte-identical.
+    mode: str = "lcb"
+    #: Down-weight stale pre-drift evidence via Page-Hinkley change-point detection
+    #: in ``rebuild`` (``changepoint.py``). Off ⇒ the straight-fold replay is
+    #: unchanged.
+    changepoint: bool = False
+
     @property
     def baseline_mean(self) -> float:
         return self.baseline_a / (self.baseline_a + self.baseline_b)
@@ -161,6 +174,25 @@ class AdvisorConfig:
     #: Per-shape representative token budgets {shape: (tok_in, tok_out)} (§5.4).
     shape_budgets: Mapping[str, tuple[float, float]]
     hp: Hyperparams = field(default_factory=Hyperparams)
+
+    # ---- v3 deferred-feature backends (DESIGN §7.3; default to v1 behaviour) ---- #
+    #: Lower-confidence-bound backend for the gate: ``"wilson"`` (v1 normal LCB on
+    #: the Beta) or ``"conformal"`` (distribution-free split-conformal — ``conformal.py``).
+    #: Conformal degrades to Wilson on a thin/empty calibration buffer, so this is a
+    #: safe drop-in.
+    lcb_backend: str = "wilson"
+    #: Hierarchical pooling backend: ``"closed-form"`` (v1 capped-pseudocount
+    #: :meth:`CellStore.pooled`) or ``"empirical-bayes"`` (genuine EB shrinkage —
+    #: ``hierarchical.py``).
+    pooling: str = "closed-form"
+    #: Federation peers (DESIGN §7.3): paths to peer ``advisor-federation.json``
+    #: exports whose observed aggregates are folded into priors. Empty ⇒ no peers,
+    #: no behaviour change.
+    federation_peers: tuple[str, ...] = ()
+    #: Trust weight applied to peer aggregates on merge (``federation.merge_peers``).
+    federation_trust: float = 0.3
+    #: Optional per-cell cap on injected peer pseudocount mass (``None`` ⇒ uncapped).
+    federation_max_peer_mass: float | None = None
 
     # ---- lookup helpers (used by the store + engine) ------------------------ #
 
@@ -353,6 +385,13 @@ def from_mapping(raw: Mapping[str, object]) -> AdvisorConfig:
     default_provider = str(adv.get("default_provider", tiers[0].provider if tiers else "claude"))
     baseline_tier_id = adv.get("baseline_tier")
     baseline_tier_id = str(baseline_tier_id) if baseline_tier_id is not None else None
+    # v3 backend selectors (DESIGN §7.3); default to v1 behaviour. Validation that
+    # the value names a known backend happens in _finalise.
+    lcb_backend = str(adv.get("lcb_backend", "wilson"))
+    pooling = str(adv.get("pooling", "closed-form"))
+
+    # ---- federation table (opt-in; default no peers ⇒ no behaviour change) ----
+    fed_peers, fed_trust, fed_max_mass = _parse_federation(raw.get("federation"))
 
     # ---- per-agent canonical shapes + per-cell overrides ----
     agent_shapes, tol_overrides, baseline_overrides, force_baseline = _parse_agents(
@@ -377,7 +416,35 @@ def from_mapping(raw: Mapping[str, object]) -> AdvisorConfig:
         force_baseline=force_baseline,
         shape_budgets=shape_budgets,
         hp=hp,
+        lcb_backend=lcb_backend,
+        pooling=pooling,
+        federation_peers=fed_peers,
+        federation_trust=fed_trust,
+        federation_max_peer_mass=fed_max_mass,
     )
+
+
+def _parse_federation(value: object) -> tuple[tuple[str, ...], float, float | None]:
+    """Parse the optional ``[federation]`` table (DESIGN §7.3 multi-tenant).
+
+    Returns ``(peers, trust, max_peer_mass)``. A missing table ⇒ ``((), 0.3, None)``
+    — no peers, so the merge is a no-op and behaviour is unchanged. ``peers`` is an
+    array of paths to peer ``advisor-federation.json`` exports; ``trust`` scales
+    borrowed mass; ``max_peer_mass`` (optional) caps injected peer pseudocount mass
+    per cell.
+    """
+    if value is None:
+        return (), 0.3, None
+    if not isinstance(value, Mapping):
+        raise ConfigError("[federation] must be a table")
+    peers_raw = value.get("peers", ())
+    if isinstance(peers_raw, (str, bytes)) or not isinstance(peers_raw, Sequence):
+        raise ConfigError("[federation] 'peers' must be an array of paths")
+    peers = tuple(str(p) for p in peers_raw)
+    trust = float(value.get("trust", 0.3))
+    mpm = value.get("max_peer_mass")
+    max_peer_mass = None if mpm is None else float(mpm)
+    return peers, trust, max_peer_mass
 
 
 def _finalise(
@@ -393,6 +460,11 @@ def _finalise(
     force_baseline: dict,
     shape_budgets: dict,
     hp: Hyperparams,
+    lcb_backend: str = "wilson",
+    pooling: str = "closed-form",
+    federation_peers: tuple[str, ...] = (),
+    federation_trust: float = 0.3,
+    federation_max_peer_mass: float | None = None,
 ) -> AdvisorConfig:
     """Validate cross-references and sort the roster into cost order."""
     if not tiers:
@@ -440,6 +512,16 @@ def _finalise(
         if tid not in {t.tier_id for t in ordered}:
             raise ConfigError(f"baseline override references unknown tier {tid!r}")
 
+    # v3 backend selectors must name a known backend (DESIGN §7.3).
+    if lcb_backend not in {"wilson", "conformal"}:
+        raise ConfigError(
+            f"lcb_backend {lcb_backend!r} must be one of {{'wilson', 'conformal'}}"
+        )
+    if pooling not in {"closed-form", "empirical-bayes"}:
+        raise ConfigError(
+            f"pooling {pooling!r} must be one of {{'closed-form', 'empirical-bayes'}}"
+        )
+
     return AdvisorConfig(
         tiers=ordered,
         shapes=tuple(shapes),
@@ -452,6 +534,13 @@ def _finalise(
         force_baseline=dict(force_baseline),
         shape_budgets=dict(shape_budgets),
         hp=hp,
+        lcb_backend=lcb_backend,
+        pooling=pooling,
+        federation_peers=tuple(federation_peers),
+        federation_trust=float(federation_trust),
+        federation_max_peer_mass=(
+            None if federation_max_peer_mass is None else float(federation_max_peer_mass)
+        ),
     )
 
 
@@ -586,6 +675,17 @@ def _parse_agents(
     return agent_shapes, tol_overrides, baseline_overrides, force_baseline
 
 
+def _as_bool(value: object) -> bool:
+    """Coerce a TOML/JSON value to ``bool`` (true/1/yes/on are truthy strings)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
 def _parse_hyperparams(value: object) -> Hyperparams:
     if value is None:
         return Hyperparams()
@@ -598,6 +698,8 @@ def _parse_hyperparams(value: object) -> Hyperparams:
         "s_prior": float, "baseline_a": float, "baseline_b": float,
         "cold_m_lo": float, "w_close": float, "w_review": float, "w_eval": float,
         "rep_tok_in": float, "rep_tok_out": float,
+        # v3 deferred-feature toggles (DESIGN §7.3); default to v1 behaviour.
+        "continuous_quality": _as_bool, "mode": str, "changepoint": _as_bool,
     }
     kwargs = {}
     for k, conv in fields.items():

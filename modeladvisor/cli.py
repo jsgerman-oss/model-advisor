@@ -215,8 +215,28 @@ def cmd_advise(args: argparse.Namespace, out: io.TextIOBase) -> int:
     engine = _load_engine()
     state = _resolve_state(args)
 
+    cfg = state.cfg
+    # --thompson: run the genuine seeded Thompson-Sampling mode (DESIGN §7.3) for
+    # this invocation by overriding the config's mode knob.
+    if getattr(args, "thompson", False):
+        cfg = cfg.with_hyperparams(mode="thompson")
+
+    # --cascade-bead: resolve the bead's downstream DAG (gc bd dep tree --json) into
+    # an effective blast radius and pass it as `cascade=` so the L3 cascade term
+    # scales with the bead's true reach (DESIGN §1.3 L3 / §7.3).
+    cascade = None
+    cascade_bead = getattr(args, "cascade_bead", None)
+    if cascade_bead:
+        cascade = _resolve_cascade(cascade_bead, out)
+
     rec = engine.recommend(
-        args.agent, args.shape, state.cfg, state.store, provider=state.provider
+        args.agent,
+        args.shape,
+        cfg,
+        state.store,
+        provider=state.provider,
+        seed=getattr(args, "seed", None),
+        cascade=cascade,
     )
 
     if args.json:
@@ -583,6 +603,224 @@ def _default_shape_for(cfg: Any, agent: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
+# eval-schedule  — Layer-4 auto-eval: rank gating cells + emit eval beads
+# --------------------------------------------------------------------------- #
+
+def cmd_eval_schedule(args: argparse.Namespace, out: io.TextIOBase) -> int:
+    """Rank the cells gating a downgrade on uncertainty and emit eval-request beads.
+
+    Drives :func:`modeladvisor.evalsched.schedule_evals` (pure planning) then
+    :func:`~modeladvisor.evalsched.emit_eval_beads` (gated emission). Dry-run by
+    default; ``--apply`` actually creates the beads (DESIGN §1.3 Layer 4 / §5.4).
+    """
+    from modeladvisor import evalsched as _evalsched
+
+    state = _resolve_state(args)
+    max_evals = getattr(args, "max", None)
+    if max_evals is None:
+        max_evals = 5
+    reqs = _evalsched.schedule_evals(state.cfg, state.store, max_evals=max_evals)
+
+    apply = getattr(args, "apply", False)
+    rig = getattr(args, "rig", None)
+    emitted = _evalsched.emit_eval_beads(reqs, dry_run=not apply, rig=rig)
+
+    if getattr(args, "json", False):
+        json.dump(
+            {
+                "mode": "apply" if apply else "dry-run",
+                "max_evals": max_evals,
+                "requests": [r.to_dict() for r in reqs],
+                "emitted": emitted,
+            },
+            out,
+            indent=2,
+            default=str,
+        )
+        out.write("\n")
+        return 0
+
+    mode = "APPLY (creating eval beads)" if apply else "DRY-RUN (no beads created)"
+    out.write(f"eval-schedule  mode: {mode}\n")
+    if not reqs:
+        out.write("  no cell is gating a downgrade on uncertainty — nothing to schedule.\n")
+        return 0
+    out.write(f"  {len(reqs)} eval probe(s) ranked by CI half-width x unlock-value:\n")
+    for r, e in zip(reqs, emitted):
+        out.write(
+            f"    {r.cell_key}  hw={r.ci_halfwidth:.3f} "
+            f"unlock={_fmt_money(r.unlock_value)} score={r.score:.4f}\n"
+        )
+        label = "would run" if not apply else "created"
+        out.write(f"      {label}: {e}\n")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# federate  — export/import per-cell observed aggregates (privacy-safe)
+# --------------------------------------------------------------------------- #
+
+def cmd_federate(args: argparse.Namespace, out: io.TextIOBase) -> int:
+    """Export this rig's per-cell aggregates, or import + merge peers' (DESIGN §7.3).
+
+    ``federate export [--out FILE]`` writes the privacy-safe observed aggregates
+    (only ``a_obs``/``b_obs``/``n`` per cell — no raw telemetry). ``federate import
+    PEER... [--trust X] [--max-peer-mass M]`` folds peer aggregates into a fresh
+    store as trust-scaled prior mass and reports the cells moved.
+    """
+    from modeladvisor import federation as _federation
+
+    state = _resolve_state(args)
+    action = getattr(args, "action", None)
+
+    if action == "export":
+        doc = _federation.export_aggregates(state.store)
+        text = json.dumps(doc, indent=2, sort_keys=True)
+        out_path = getattr(args, "out", None)
+        if out_path:
+            os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+            out.write(f"federate export: wrote {len(doc['cells'])} cell(s) -> {out_path}\n")
+        else:
+            out.write(text + "\n")
+        return 0
+
+    if action == "import":
+        peers = list(getattr(args, "peers", []) or [])
+        if not peers:
+            out.write("federate import: no peer export paths given.\n")
+            return 2
+        # Config-supplied defaults; CLI flags override when present.
+        trust = getattr(args, "trust", None)
+        if trust is None:
+            trust = getattr(state.cfg, "federation_trust", 0.3)
+        mpm = getattr(args, "max_peer_mass", None)
+        if mpm is None:
+            mpm = getattr(state.cfg, "federation_max_peer_mass", None)
+        try:
+            merged = _federation.merge_peers(
+                state.store, peers, trust=trust, max_peer_mass=mpm
+            )
+        except _federation.FederationError as e:
+            out.write(f"federate import: {e}\n")
+            return 2
+
+        if getattr(args, "json", False):
+            json.dump(
+                {
+                    "peers": peers,
+                    "trust": trust,
+                    "max_peer_mass": mpm,
+                    "merged_observed_cells": len(merged.observed_cells()),
+                },
+                out,
+                indent=2,
+                default=str,
+            )
+            out.write("\n")
+            return 0
+
+        out.write(
+            f"federate import: merged {len(peers)} peer(s) at trust={trust} "
+            f"-> {len(merged.observed_cells())} observed cell(s).\n"
+        )
+        return 0
+
+    out.write("federate: expected a subcommand 'export' or 'import'.\n")
+    return 2
+
+
+# --------------------------------------------------------------------------- #
+# drift  — report Page-Hinkley change-points per cell from the telemetry stream
+# --------------------------------------------------------------------------- #
+
+def cmd_drift(args: argparse.Namespace, out: io.TextIOBase) -> int:
+    """Report detected upstream-drift change-points per cell (DESIGN §7.3).
+
+    Reads the ordered ``kind="quality"`` records from the telemetry
+    ``invocations.jsonl``, groups them per cell, and runs
+    :func:`modeladvisor.changepoint.detect_changepoints` on each cell's time-ordered
+    ``q`` stream. Optional ``--agent``/``--shape``/``--provider`` filters narrow the
+    sweep. This is the read-only operator view of the adaptive safety hatch that
+    supersedes the static ``force_baseline`` (DESIGN §7.4).
+    """
+    from modeladvisor import changepoint as _changepoint
+    from modeladvisor.store import parse_cell_key, read_jsonl
+
+    state = _resolve_state(args)
+    telemetry_dir = (
+        getattr(args, "telemetry_dir", None)
+        or os.environ.get("ADVISOR_TELEMETRY_DIR")
+        or os.path.join(os.getcwd(), ".beads", "telemetry")
+    )
+    jsonl = os.path.join(telemetry_dir, "invocations.jsonl")
+
+    want_agent = getattr(args, "agent", None)
+    want_shape = getattr(args, "shape", None)
+    want_provider = getattr(args, "provider", None) or state.provider
+
+    # Group ordered q-streams per cell from the quality records.
+    streams: dict[str, list[float]] = {}
+    for rec in read_jsonl(jsonl):
+        if rec.get("kind") != "quality":
+            continue
+        key = rec.get("cell_key")
+        q = rec.get("q")
+        if not key or q is None:
+            continue
+        try:
+            prov, agent, shape, _tier = parse_cell_key(str(key))
+        except ValueError:
+            continue
+        if want_agent and agent != want_agent:
+            continue
+        if want_shape and shape != want_shape:
+            continue
+        if want_provider and prov != want_provider:
+            continue
+        try:
+            streams.setdefault(str(key), []).append(float(q))
+        except (TypeError, ValueError):
+            continue
+
+    drifted: list[dict] = []
+    for key in sorted(streams):
+        obs = streams[key]
+        cps = _changepoint.detect_changepoints(obs)
+        if not cps:
+            continue
+        c_star = max(cps)
+        pre = obs[:c_star] or obs[:1]
+        post = obs[c_star:] or obs[-1:]
+        drifted.append(
+            {
+                "cell_key": key,
+                "n": len(obs),
+                "changepoints": cps,
+                "pre_mean": round(sum(pre) / len(pre), 4),
+                "post_mean": round(sum(post) / len(post), 4),
+            }
+        )
+
+    if getattr(args, "json", False):
+        json.dump({"cells_scanned": len(streams), "drifted": drifted}, out, indent=2)
+        out.write("\n")
+        return 0
+
+    out.write(f"drift: scanned {len(streams)} cell(s) with telemetry\n")
+    if not drifted:
+        out.write("  no change-points detected — all scanned cells look stationary.\n")
+        return 0
+    for d in drifted:
+        out.write(
+            f"  {d['cell_key']}  n={d['n']}  shifts@{d['changepoints']}  "
+            f"mean {d['pre_mean']} -> {d['post_mean']}\n"
+        )
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # gc config editing  (the heart of `apply`)
 # --------------------------------------------------------------------------- #
 #
@@ -906,6 +1144,39 @@ def _resolve_state(args: argparse.Namespace) -> State:
     )
 
 
+def _resolve_cascade(bead_id: str, out: io.TextIOBase) -> Any:
+    """Shell ``gc bd dep tree --json <bead>`` into a :class:`cascade.CascadeResult`.
+
+    Best-effort + non-fatal: any failure (gc absent, non-JSON, unknown bead) prints
+    a note and returns ``None`` so the advice still runs with the flat ``N_dep``
+    (DESIGN §8 — the advisor must never block a dispatch).
+    """
+    import subprocess
+
+    from modeladvisor import cascade as _cascade
+
+    try:
+        proc = subprocess.run(
+            ["gc", "bd", "dep", "tree", "--json", bead_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:  # pragma: no cover - needs gc
+        out.write(f"  note: --cascade-bead ignored (gc bd dep tree failed: {e})\n")
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():  # pragma: no cover - needs gc
+        out.write("  note: --cascade-bead ignored (gc bd dep tree returned nothing)\n")
+        return None
+    try:
+        tree = json.loads(proc.stdout)
+    except (ValueError, json.JSONDecodeError):  # pragma: no cover - needs gc
+        out.write("  note: --cascade-bead ignored (dep tree was not valid JSON)\n")
+        return None
+    graph = _cascade.build_graph_from_dep_json(tree)
+    return _cascade.effective_cascade(graph, bead_id)
+
+
 # --------------------------------------------------------------------------- #
 # argparse
 # --------------------------------------------------------------------------- #
@@ -940,6 +1211,13 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("shape")
     a.add_argument("--json", action="store_true",
                    help="emit the structured `reasons` audit object")
+    a.add_argument("--thompson", action="store_true",
+                   help="use the genuine seeded Thompson-Sampling mode (DESIGN §7.3)")
+    a.add_argument("--seed", type=int, default=None,
+                   help="RNG seed for --thompson (reproducible draw)")
+    a.add_argument("--cascade-bead", dest="cascade_bead", metavar="ID",
+                   help="scale N_dep by this bead's downstream DAG "
+                   "(gc bd dep tree --json)")
     a.set_defaults(func=cmd_advise)
 
     i = sub.add_parser(
@@ -991,6 +1269,58 @@ def build_parser() -> argparse.ArgumentParser:
     aa.add_argument("--json", action="store_true",
                     help="emit the full structured per-agent report as JSON")
     aa.set_defaults(func=cmd_auto_apply)
+
+    # ---- eval-schedule: Layer-4 auto-eval (DESIGN §5.4) ----
+    es = sub.add_parser(
+        "eval-schedule",
+        help="rank gating cells by CI half-width x unlock-value and emit eval "
+        "beads for the top N (dry-run by default)",
+    )
+    es.add_argument("--max", type=int, default=5,
+                    help="cap on eval beads to schedule this run (default 5)")
+    es.add_argument("--rig", metavar="NAME",
+                    help="create the eval beads in this rig's database")
+    es.add_argument("--city", help="city root (else $GC_CITY or cwd)")
+    es.add_argument("--apply", action="store_true",
+                    help="actually create the eval beads (otherwise dry-run-safe)")
+    es.add_argument("--json", action="store_true",
+                    help="emit the ranked plan + emitted commands/ids as JSON")
+    es.set_defaults(func=cmd_eval_schedule)
+
+    # ---- federate: export/import per-cell observed aggregates (DESIGN §7.3) ----
+    fe = sub.add_parser(
+        "federate",
+        help="export this rig's per-cell aggregates, or import + merge peers'",
+    )
+    fe_sub = fe.add_subparsers(dest="action", required=True)
+    fe_exp = fe_sub.add_parser(
+        "export", help="write privacy-safe per-cell aggregates (a_obs/b_obs/n)",
+    )
+    fe_exp.add_argument("--out", help="write to this file (else stdout)")
+    fe_exp.set_defaults(func=cmd_federate)
+    fe_imp = fe_sub.add_parser(
+        "import", help="fold peer aggregate exports into a merged store",
+    )
+    fe_imp.add_argument("peers", nargs="+", help="peer advisor-federation.json path(s)")
+    fe_imp.add_argument("--trust", type=float, default=None,
+                        help="trust weight on peer mass (else config / 0.3)")
+    fe_imp.add_argument("--max-peer-mass", dest="max_peer_mass", type=float,
+                        default=None, help="cap injected peer pseudocount mass per cell")
+    fe_imp.add_argument("--json", action="store_true",
+                        help="emit the merge summary as JSON")
+    fe_imp.set_defaults(func=cmd_federate)
+
+    # ---- drift: report Page-Hinkley change-points per cell (DESIGN §7.3) ----
+    dr = sub.add_parser(
+        "drift",
+        help="report detected upstream-drift change-points per cell from telemetry",
+    )
+    dr.add_argument("--agent", help="filter to this agent")
+    dr.add_argument("--shape", help="filter to this shape")
+    dr.add_argument("--provider", help="filter to this provider (else config default)")
+    dr.add_argument("--json", action="store_true",
+                    help="emit the per-cell drift report as JSON")
+    dr.set_defaults(func=cmd_drift)
 
     return p
 

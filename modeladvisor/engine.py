@@ -30,10 +30,13 @@ from __future__ import annotations
 
 import math
 from statistics import NormalDist
-from typing import Mapping
+from typing import TYPE_CHECKING, Mapping
 
 from modeladvisor.config import AdvisorConfig
 from modeladvisor.store import Cell, CellStore, cell_key
+
+if TYPE_CHECKING:  # annotation only; cascade is built by the caller and passed in.
+    from modeladvisor.cascade import CascadeResult
 
 # Sentinel for "no admitted downgrade beats the baseline" / cold start.
 _BASELINE_RATIONALE = "no cheaper tier has cleared tolerance (insufficient evidence)"
@@ -53,6 +56,24 @@ def wilson_lcb(cell: Cell, z: float) -> float:
     the default one-sided ``alpha = 0.05``.
     """
     return max(0.0, cell.mean - z * cell.stderr)
+
+
+def _lcb(cell: Cell, cfg: AdvisorConfig) -> float:
+    """Resolve the gate's lower confidence bound under the configured backend.
+
+    ``cfg.lcb_backend == 'conformal'`` ⇒ the distribution-free split-conformal bound
+    (:func:`modeladvisor.conformal.conformal_lcb`) over the cell's rolling
+    calibration buffer (``cell.calib``); an empty/thin buffer falls back to Wilson,
+    so the result is identical to :func:`wilson_lcb` on a day-1 cell. Default
+    (``'wilson'``) ⇒ :func:`wilson_lcb` unchanged (the v1 path, byte-identical).
+    """
+    hp = cfg.hp
+    if cfg.lcb_backend == "conformal":
+        from modeladvisor import conformal as _conformal
+
+        buffer = cell.calib or _conformal.CalibrationBuffer()
+        return _conformal.conformal_lcb(cell, buffer, hp.z, alpha=hp.alpha)
+    return wilson_lcb(cell, hp.z)
 
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +139,7 @@ def recommend(
     tok_in: float | None = None,
     tok_out: float | None = None,
     seed: int | None = None,
+    cascade: "CascadeResult | None" = None,
 ) -> dict:
     """Recommend the cost-minimal tier for ``(agent, shape)`` under the quality gate.
 
@@ -142,8 +164,14 @@ def recommend(
         Realised token counts for the cost differential. If omitted, the shape's
         representative budget is used and flagged in the rationale (DESIGN §5.4).
     seed:
-        Reserved for the future genuine-Thompson-Sampling mode; ignored by the
-        deterministic v1 rule but echoed into ``reasons`` for reproducibility.
+        Seeds the genuine Thompson-Sampling mode (``cfg.hp.mode == 'thompson'``);
+        ignored by the deterministic ``lcb`` rule but echoed into ``reasons`` for
+        reproducibility.
+    cascade:
+        Optional DAG-propagated effective blast radius (``cascade.CascadeResult``,
+        DESIGN §7.3). When given, ``n_dep`` is overridden by
+        ``max(1, round(cascade.n_dep_eff))`` so the asymmetric-loss cascade term
+        scales with the bead's true downstream reach; surfaced under ``reasons``.
 
     Returns
     -------
@@ -174,18 +202,54 @@ def recommend(
 
     forced = cfg.is_forced_baseline(agent, shape)
 
+    # Cascade-aware blast radius (DESIGN §7.3): a DAG-propagated effective N_dep
+    # overrides the flat scalar so the L3 cascade term scales with true downstream
+    # reach. Floor at 1 (the §1.3 default). ``cascade is None`` ⇒ n_dep unchanged.
+    cascade_n_dep = None
+    if cascade is not None:
+        n_dep = max(1, round(cascade.n_dep_eff))
+        cascade_n_dep = n_dep
+
+    order = list(cfg.tier_ids)  # cheapest -> most-capable
+    base_idx = order.index(base_id)
+
+    # ------------------------------------------------------------------ #
+    # Genuine Thompson-Sampling mode (DESIGN §7.3, gated). Default 'lcb'  #
+    # path below is byte-unchanged; thompson threads the seed and builds  #
+    # a reasons object whose keys match the lcb audit so cli/--json work. #
+    # ------------------------------------------------------------------ #
+    if cfg.hp.mode == "thompson":
+        return _recommend_thompson(
+            cfg=cfg,
+            store=store,
+            provider=provider,
+            agent=agent,
+            shape=shape,
+            base_id=base_id,
+            klass=klass,
+            forced=forced,
+            order=order,
+            base_idx=base_idx,
+            mu_star=mu_star,
+            gate_threshold=gate_threshold,
+            n_dep=n_dep,
+            tok_in=tok_in,
+            tok_out=tok_out,
+            representative=representative,
+            seed=seed,
+            cascade_n_dep=cascade_n_dep,
+        )
+
     # ------------------------------------------------------------------ #
     # Build the candidate set + per-candidate audit rows.                #
     # ------------------------------------------------------------------ #
-    order = list(cfg.tier_ids)  # cheapest -> most-capable
-    base_idx = order.index(base_id)
 
     candidates: list[dict] = []
     posterior_summary: dict[str, dict] = {}
 
     for tid in order:
         cell = store.pooled(provider, agent, shape, tid)
-        q_lo = wilson_lcb(cell, hp.z)
+        q_lo = _lcb(cell, cfg)
         idx = order.index(tid)
 
         posterior_summary[tid] = {
@@ -319,12 +383,168 @@ def recommend(
         "representative_budget": representative,
         "forced_baseline": forced,
         "seed": seed,
+        "mode": "lcb",
+        "lcb_backend": cfg.lcb_backend,
+        "pooling": cfg.pooling,
         "candidates": candidates,
         "advised_tier": chosen_id,
         "eval_flag": eval_flag,
         "eval_ci_halfwidth": round(ci_hw, 6),
         "theta_eval": hp.theta_eval,
     }
+    if cascade_n_dep is not None:
+        reasons["cascade"] = {
+            "n_dep_eff": round(cascade.n_dep_eff, 6),
+            "n_dep_applied": cascade_n_dep,
+            "depth": cascade.depth,
+            "n_nodes": cascade.n_nodes,
+            "rationale": cascade.rationale,
+        }
+
+    return {
+        "tier_id": chosen_id,
+        "model": cfg.tier(chosen_id).model,
+        "rationale": rationale,
+        "cost_delta": round(cost_delta, 8),
+        "reasons": reasons,
+        "posterior_summary": posterior_summary,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Thompson-Sampling mode (DESIGN §7.3, gated by cfg.hp.mode == 'thompson')      #
+# --------------------------------------------------------------------------- #
+
+
+def _recommend_thompson(
+    *,
+    cfg: AdvisorConfig,
+    store: CellStore,
+    provider: str,
+    agent: str,
+    shape: str,
+    base_id: str,
+    klass,
+    forced: bool,
+    order: list[str],
+    base_idx: int,
+    mu_star: float,
+    gate_threshold: float,
+    n_dep: int,
+    tok_in: float,
+    tok_out: float,
+    representative: bool,
+    seed: int | None,
+    cascade_n_dep: int | None,
+) -> dict:
+    """The genuine Thompson-Sampling decision (DESIGN §7.3), seeded + reproducible.
+
+    Draws one posterior sample per tier via :func:`modeladvisor.thompson.thompson_select`
+    and picks the cost-minimal admissible tier under the *same* safety constraints
+    as the deterministic rule (baseline always admissible; ``Critical``/forced cells
+    never downgrade — the ``M[Critical]=∞`` hard rule / §7.4 hatch). Returns the same
+    result shape as :func:`recommend`'s ``lcb`` path, with a ``reasons`` object whose
+    keys (``cell``, ``class``, ``candidates``, ``eval_flag``, …) match so ``cli`` /
+    ``--json`` render identically; the per-tier sampled audit rides under
+    ``reasons['thompson']``.
+    """
+    from modeladvisor import thompson as _thompson
+
+    hp = cfg.hp
+    cells_by_tier = {tid: store.pooled(provider, agent, shape, tid) for tid in order}
+
+    chosen_id, audit = _thompson.thompson_select(
+        order,
+        cells_by_tier,
+        base_id,
+        q_tol=klass.q_tol,
+        is_critical=klass.is_critical,
+        forced=forced,
+        seed=seed,
+    )
+
+    # Cost vs baseline for the chosen tier (negative = savings), at the budget.
+    if chosen_id == base_id:
+        cost_delta = 0.0
+    elif order.index(chosen_id) < base_idx:
+        cost_delta = -_delta_cost(cfg, base_id, chosen_id, tok_in, tok_out)
+    else:
+        cost_delta = +_delta_cost(cfg, chosen_id, base_id, tok_in, tok_out)
+
+    # Build a candidate list in the lcb audit's shape so the CLI table renders.
+    candidates: list[dict] = []
+    posterior_summary: dict[str, dict] = {}
+    audit_by_tier = {row["tier_id"]: row for row in audit["tiers"]}
+    for tid in order:
+        cell = cells_by_tier[tid]
+        row = audit_by_tier[tid]
+        if tid == base_id:
+            cdiff = 0.0
+        elif order.index(tid) < base_idx:
+            cdiff = -_delta_cost(cfg, base_id, tid, tok_in, tok_out)
+        else:
+            cdiff = +_delta_cost(cfg, tid, base_id, tok_in, tok_out)
+        posterior_summary[tid] = {
+            "a": round(cell.a, 6),
+            "b": round(cell.b, 6),
+            "mean": round(cell.mean, 6),
+            "theta": row["theta"],
+            "n": cell.n,
+        }
+        candidates.append(
+            {
+                "tier_id": tid,
+                "model": cfg.tier(tid).model,
+                "action": row["action"],
+                "admitted": row["admitted"],
+                "theta": row["theta"],
+                "mean": round(cell.mean, 6),
+                "cost_diff": round(cdiff, 8),
+                "n": cell.n,
+                "reason": row["reason"],
+            }
+        )
+
+    chosen_cell = cells_by_tier[chosen_id]
+    ci_hw = _ci_halfwidth(chosen_cell, hp.alpha)
+    eval_flag = ci_hw > hp.theta_eval
+
+    rationale = f"{chosen_id}: {audit['decision']} (Thompson, seed={seed})."
+
+    reasons = {
+        "cell": {
+            "provider": provider,
+            "agent": agent,
+            "shape": shape,
+            "baseline_tier": base_id,
+            "baseline_cell_key": cell_key(provider, agent, shape, base_id),
+        },
+        "class": klass.name,
+        "q_tol": klass.q_tol,
+        "multiplier": (None if math.isinf(klass.multiplier) else klass.multiplier),
+        "critical": klass.is_critical,
+        "baseline_mean": round(mu_star, 6),
+        "gate_threshold": round(gate_threshold, 6),
+        "alpha": hp.alpha,
+        "z": hp.z,
+        "n_dep": n_dep,
+        "tok_in": tok_in,
+        "tok_out": tok_out,
+        "representative_budget": representative,
+        "forced_baseline": forced,
+        "seed": seed,
+        "mode": "thompson",
+        "lcb_backend": cfg.lcb_backend,
+        "pooling": cfg.pooling,
+        "candidates": candidates,
+        "advised_tier": chosen_id,
+        "eval_flag": eval_flag,
+        "eval_ci_halfwidth": round(ci_hw, 6),
+        "theta_eval": hp.theta_eval,
+        "thompson": audit,
+    }
+    if cascade_n_dep is not None:
+        reasons["cascade"] = {"n_dep_applied": cascade_n_dep}
 
     return {
         "tier_id": chosen_id,
@@ -479,7 +699,7 @@ def inspect(
 
     for tid in order:
         cell = store.pooled(provider, agent, shape, tid)
-        q_lo = wilson_lcb(cell, hp.z)
+        q_lo = _lcb(cell, cfg)
         ci_hw = _ci_halfwidth(cell, hp.alpha)
         idx = order.index(tid)
 

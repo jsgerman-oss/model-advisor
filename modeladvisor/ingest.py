@@ -224,11 +224,16 @@ class DispatchIndex:
 
 @dataclass(frozen=True)
 class Observation:
-    """A single quality observation distilled from a bead (pre-join)."""
+    """A single quality observation distilled from a bead (pre-join).
+
+    ``q`` is a binary ``{0, 1}`` Bernoulli outcome by default (DESIGN §1.1); under
+    the continuous-quality feature (DESIGN §7.3) it may instead be a graded score in
+    ``[0, 1]`` (a reviewer fraction / test-pass ratio), hence the ``float`` type.
+    """
 
     bead_id: str
     session_id: str
-    q: int
+    q: float
     channel: str  # "close" | "review" | "eval"
     signal: str  # raw audit token
     n_dep: int = 1
@@ -268,10 +273,44 @@ def _has_escalation(bead: Mapping[str, object], meta: Mapping[str, object]) -> b
     return False
 
 
+#: Metadata keys carrying a graded numeric quality score (DESIGN §7.3 continuous).
+#: A fraction in [0, 1] is used directly; a 0–100 score is normalised by /100.
+#: Eval-channel scores are preferred over review-channel (fidelity order, §4.4).
+_EVAL_SCORE_KEYS = ("gc.eval_score", "gc.eval_fraction", "gc.test_pass_fraction")
+_REVIEW_SCORE_KEYS = ("gc.review_score", "gc.score", "gc.quality_score")
+
+
+def _graded_score(meta: Mapping[str, object], keys: tuple[str, ...]) -> float | None:
+    """Read + normalise a graded numeric score from ``meta`` to ``[0, 1]`` (§7.3).
+
+    A value already in ``[0, 1]`` is used as-is; a value in ``(1, 100]`` is treated
+    as a percentage and divided by 100. Non-numeric / out-of-range / non-finite
+    values yield ``None`` (the caller then falls back to the binary verdict).
+    """
+    import math as _math
+
+    for k in keys:
+        v = meta.get(k)
+        if v is None or v == "":
+            continue
+        try:
+            f = float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if not _math.isfinite(f):
+            continue
+        if 0.0 <= f <= 1.0:
+            return f
+        if 1.0 < f <= 100.0:
+            return f / 100.0
+    return None
+
+
 def classify_bead(
     bead: Mapping[str, object],
     *,
     event_type: str | None = None,
+    continuous: bool = False,
 ) -> Observation | None:
     """Distil a bead (+ optional event type) into one :class:`Observation`.
 
@@ -284,6 +323,12 @@ def classify_bead(
     read as a negative even though the bead object may momentarily still look
     closed; ``bead.closed`` / ``bead.updated`` are treated by the bead's own
     fields.
+
+    ``continuous`` (DESIGN §7.3, off by default): when set, a graded numeric score
+    on the eval/review channel (``gc.eval_score`` / ``gc.review_score`` / a
+    test-pass fraction, normalised to ``[0, 1]``) is emitted as a continuous ``q``
+    instead of the binary pass/fail. Absent a graded score the binary mapping is
+    used unchanged, so this is a strict superset of the v1 behaviour.
     """
     meta = bead.get("metadata")
     if not isinstance(meta, Mapping):
@@ -304,6 +349,12 @@ def classify_bead(
         return None
 
     # ---- highest fidelity: Channel C, eval verdict (DESIGN §4.3) -------------
+    # Continuous (graded) eval score wins over the binary verdict when enabled.
+    if continuous:
+        score = _graded_score(meta, _EVAL_SCORE_KEYS)
+        if score is not None:
+            return Observation(bead_id, session_id, score, "eval", f"eval:score={score:.3f}", n_dep)
+
     eval_verdict = _meta_get(meta, "gc.eval_verdict", "gc.eval_outcome").lower()
     if eval_verdict:
         if eval_verdict in _EVAL_PASS:
@@ -313,6 +364,12 @@ def classify_bead(
         # Unknown eval token: fall through to lower channels.
 
     # ---- Channel B, reviewer verdict (DESIGN §4.2) --------------------------
+    # Continuous (graded) review score wins over the binary verdict when enabled.
+    if continuous:
+        score = _graded_score(meta, _REVIEW_SCORE_KEYS)
+        if score is not None:
+            return Observation(bead_id, session_id, score, "review", f"review:score={score:.3f}", n_dep)
+
     verdict = _meta_get(meta, "gc.verdict", "gc.review_verdict").lower()
     if verdict:
         if verdict in _REVIEW_DROP:
@@ -472,14 +529,21 @@ def _build_quality_record(
     *,
     ts: str,
 ) -> dict:
-    """Assemble a DESIGN §5.2 ``kind="quality"`` record from obs + joined cell."""
+    """Assemble a DESIGN §5.2 ``kind="quality"`` record from obs + joined cell.
+
+    ``q`` is emitted as an ``int`` for a binary ``{0, 1}`` outcome (the v1 wire
+    shape, byte-identical) and as a ``float`` only for a genuinely fractional
+    graded score (DESIGN §7.3 continuous), so default telemetry is unchanged.
+    """
+    q_int = int(obs.q)
+    q_out = q_int if float(q_int) == float(obs.q) else float(obs.q)
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "quality",
         "ts": ts,
         "bead_id": obs.bead_id or ref.bead_id,
         "cell_key": ref.cell_key,
-        "q": int(obs.q),
+        "q": q_out,
         "channel": obs.channel,
         "weight": _channel_weight(cfg, obs.channel),
         "signal": obs.signal,
@@ -594,6 +658,9 @@ def harvest(
 
     cfg = config or load_config(config_path)
     ts = now or _utcnow_iso()
+    # Continuous-quality feature (DESIGN §7.3): when on, a graded numeric eval/review
+    # score is emitted as a fractional q; off ⇒ binary v1 mapping (default).
+    continuous = bool(getattr(cfg.hp, "continuous_quality", False))
 
     # ---- build the dispatch join index ------------------------------------
     index = DispatchIndex.from_jsonl(invocations_path)
@@ -619,7 +686,7 @@ def harvest(
     unjoined_seen: set[str] = set()
 
     for etype, bead in candidates:
-        obs = classify_bead(bead, event_type=etype)
+        obs = classify_bead(bead, event_type=etype, continuous=continuous)
         if obs is None:
             result.skipped += 1
             continue
