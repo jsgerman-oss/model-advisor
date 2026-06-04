@@ -484,6 +484,137 @@ def test_real_inspect_text_and_json(monkeypatch, tmp_path):
     assert "widest_gating_cell" in obj
 
 
+# --------------------------------------------------------------------------- #
+# apply — provider-aware (cross-provider) routing: a tier write sets the full
+# gc.provider / gc.model / gc.run_target triple, not just the model.
+# --------------------------------------------------------------------------- #
+
+class _FakeTier:
+    def __init__(self, tier_id, provider, model, run_target):
+        self.tier_id = tier_id
+        self.provider = provider
+        self.model = model
+        self.run_target = run_target
+
+
+# A tiny cross-provider roster the fake cfg serves to cmd_apply so it can resolve
+# the chosen tier's provider + run_target (the engine only returns a tier_id).
+_FAKE_ROSTER = {
+    "gpt54": _FakeTier("gpt54", "codex", "gpt-5.4", "codex-gpt54"),
+    "sonnet": _FakeTier("sonnet", "claude", "claude-sonnet-4-5", "claude-sonnet"),
+}
+
+
+class _FakeRosterCfg(_FakeCfg):
+    """A fake cfg exposing the tier-lookup surface cmd_apply needs."""
+
+    def has_tier(self, tier_id):
+        return tier_id in _FAKE_ROSTER
+
+    def tier(self, tier_id):
+        return _FAKE_ROSTER[tier_id]
+
+
+def _install_fake_roster(monkeypatch, *, model, tier, provider):
+    eng = FakeEngine(model=model, tier=tier)
+    monkeypatch.setattr(cli, "ENGINE", eng, raising=False)
+    monkeypatch.setattr(cli, "_load_engine", lambda: eng, raising=False)
+    monkeypatch.setattr(
+        cli, "build_state",
+        lambda **kw: cli.State(
+            cfg=_FakeRosterCfg(), store=object(), provider=provider
+        ),
+        raising=False,
+    )
+    return eng
+
+
+def test_apply_codex_tier_writes_full_routing_triple(monkeypatch, tmp_path):
+    """`apply` of a Codex tier writes provider=codex + model + run_target=codex-*."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    agent_toml = _write(tmp_path, "agent.toml", FLAT_AGENT_TOML)
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    rc, text = _run("apply", "polecat", "--shape", "implement")
+    assert rc == 0
+    assert "applied:" in text and "backup:" in text
+
+    updated = agent_toml.read_text()
+    assert 'provider = "codex"' in updated
+    assert 'model = "gpt-5.4"' in updated
+    assert 'run_target = "codex-gpt54"' in updated
+    # one of each, surrounding lines preserved
+    assert updated.count("provider = ") == 1
+    assert updated.count("model = ") == 1
+    assert updated.count("run_target = ") == 1
+    assert 'scope = "rig"' in updated
+    assert "max_active_sessions = 5" in updated
+
+
+def test_apply_claude_tier_writes_full_routing_triple(monkeypatch, tmp_path):
+    _install_fake_roster(
+        monkeypatch, model="claude-sonnet-4-5", tier="sonnet", provider="claude"
+    )
+    agent_toml = _write(tmp_path, "agent.toml", FLAT_AGENT_TOML)
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    rc, _ = _run("apply", "polecat", "--shape", "implement")
+    assert rc == 0
+    updated = agent_toml.read_text()
+    assert 'provider = "claude"' in updated
+    assert 'model = "claude-sonnet-4-5"' in updated
+    assert 'run_target = "claude-sonnet"' in updated
+
+
+def test_apply_json_surfaces_dispatch_metadata(monkeypatch, tmp_path):
+    """`apply --json` emits the per-DISPATCH gc.provider/gc.model/gc.run_target."""
+    _install_fake_roster(monkeypatch, model="gpt-5.4", tier="gpt54", provider="codex")
+    agent_toml = _write(tmp_path, "agent.toml", FLAT_AGENT_TOML)
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    rc, text = _run("apply", "polecat", "--shape", "implement", "--json")
+    assert rc == 0
+    obj = json.loads(text)
+    assert obj["applied"] is True
+    assert obj["provider"] == "codex"
+    assert obj["model"] == "gpt-5.4"
+    assert obj["run_target"] == "codex-gpt54"
+    assert obj["dispatch_metadata"] == {
+        "gc.provider": "codex",
+        "gc.model": "gpt-5.4",
+        "gc.run_target": "codex-gpt54",
+    }
+    # and the file really was written with the triple
+    updated = agent_toml.read_text()
+    assert 'provider = "codex"' in updated and 'run_target = "codex-gpt54"' in updated
+
+
+def test_set_tier_fields_is_byte_preserving_and_idempotent(tmp_path):
+    """cli.set_tier_fields: replace-or-insert the triple, surrounding bytes intact."""
+    flat = 'scope = "rig"\nidle_timeout = "2h"\n'
+    p = _write(tmp_path, "agent.toml", flat)
+    target = cli.ConfigTarget(path=str(p), kind="flat", agent="polecat")
+
+    cli.set_tier_fields(
+        target, provider="codex", model="gpt-5.4", run_target="codex-gpt54"
+    )
+    once = p.read_text()
+    assert cli.read_field(target, "provider") == "codex"
+    assert cli.read_field(target, "model") == "gpt-5.4"
+    assert cli.read_field(target, "run_target") == "codex-gpt54"
+    # surrounding lines untouched
+    assert 'scope = "rig"' in once and 'idle_timeout = "2h"' in once
+
+    # Re-applying the same triple is byte-identical (no duplicate lines).
+    cli.set_tier_fields(
+        target, provider="codex", model="gpt-5.4", run_target="codex-gpt54"
+    )
+    assert p.read_text() == once
+    assert once.count("provider = ") == 1
+    assert once.count("model = ") == 1
+    assert once.count("run_target = ") == 1
+
+
 @real_engine
 def test_real_apply_lifecycle_on_temp_config(monkeypatch, tmp_path):
     # full apply lifecycle against the real engine, on a TEMP flat agent.toml.

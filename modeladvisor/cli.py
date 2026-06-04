@@ -412,26 +412,93 @@ def cmd_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
         )
         return 2
 
+    # The full cross-provider routing target for the chosen tier: provider +
+    # model + run_target.  Applying a tier must set all three so a Codex tier
+    # actually runs on Codex (not just rename the model).  Resolve them from the
+    # roster (the engine returns a tier_id; the config owns the routing fields).
+    new_provider = _get(rec, "provider", state.provider)
+    new_run_target: Optional[str] = None
+    dispatch: Optional[dict] = None
+    if new_tier and getattr(state.cfg, "has_tier", None) and state.cfg.has_tier(new_tier):
+        tier = state.cfg.tier(new_tier)
+        new_provider = tier.provider or new_provider
+        new_run_target = tier.run_target or None
+        dispatch = dispatch_metadata(state.cfg, new_tier)
+
     # Resolve the gc config file + the scope (flat agent.toml / [[agent]] /
-    # [agent_defaults]) that owns this agent's model field.
+    # [agent_defaults]) that owns this agent's routing fields.
     try:
         target = resolve_agent_config(
             args.agent, city=args.city, rig=args.rig
         )
     except ConfigResolveError as e:
-        out.write(f"apply: {e}\n")
+        if getattr(args, "json", False):
+            json.dump({"agent": args.agent, "error": str(e)}, out, default=str)
+            out.write("\n")
+        else:
+            out.write(f"apply: {e}\n")
         return 2
 
     current = read_model_field(target)
+    cur_provider = read_field(target, "provider")
+    cur_run_target = read_field(target, "run_target")
+
+    # Refuse the no-op: the recommended model is already in effect.  (We key the
+    # no-op on the model for back-compat with v1; provider/run_target are written
+    # additively when the model itself changes.)
+    is_noop = current is not None and current == new_model
+
+    if getattr(args, "json", False):
+        payload = {
+            "agent": args.agent,
+            "shape": shape,
+            "config": target.path,
+            "scope": target.describe(),
+            "recommended_tier": new_tier,
+            "provider": new_provider,
+            "model": new_model,
+            "run_target": new_run_target,
+            "current": {
+                "provider": cur_provider,
+                "model": current,
+                "run_target": cur_run_target,
+            },
+            "dispatch_metadata": dispatch,
+            "dry_run": bool(args.dry_run),
+            "noop": is_noop,
+            "applied": False,
+        }
+        if is_noop:
+            payload["reason"] = "recommended model equals the current model"
+            json.dump(payload, out, indent=2, default=str)
+            out.write("\n")
+            return 3
+        if not args.dry_run:
+            backup = backup_file(target.path)
+            set_tier_fields(
+                target,
+                provider=new_provider,
+                model=new_model,
+                run_target=new_run_target,
+            )
+            payload["applied"] = True
+            payload["backup"] = backup
+        json.dump(payload, out, indent=2, default=str)
+        out.write("\n")
+        return 0
 
     out.write(f"apply {args.agent} (shape={shape})\n")
     out.write(f"  config: {target.path}\n")
     out.write(f"  scope:  {target.describe()}\n")
-    out.write(f"  recommended tier: {new_tier}  model: {new_model}\n")
+    out.write(
+        f"  recommended tier: {new_tier}  provider: {new_provider}  "
+        f"model: {new_model}"
+        + (f"  run_target: {new_run_target}" if new_run_target else "")
+        + "\n"
+    )
     out.write(f"  current model:    {current if current is not None else '(unset)'}\n")
 
-    # Refuse the no-op: recommended model already in effect.
-    if current is not None and current == new_model:
+    if is_noop:
         out.write(
             "  refused: recommended model equals the current model "
             f"('{new_model}') — no change to apply.\n"
@@ -440,21 +507,33 @@ def cmd_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
 
     if args.dry_run:
         out.write(
-            f"  DRY-RUN: would set model = \"{new_model}\" "
-            f"(was {current if current is not None else 'unset'}); no file written.\n"
+            f"  DRY-RUN: would set provider = \"{new_provider}\", "
+            f"model = \"{new_model}\""
+            + (f", run_target = \"{new_run_target}\"" if new_run_target else "")
+            + f" (model was {current if current is not None else 'unset'}); "
+            "no file written.\n"
         )
         return 0
 
     backup = backup_file(target.path)
-    set_model_field(target, new_model)
+    set_tier_fields(
+        target,
+        provider=new_provider,
+        model=new_model,
+        run_target=new_run_target,
+    )
 
     out.write(f"  backup: {backup}\n")
     out.write(
-        f"  applied: model {current if current is not None else 'unset'} -> \"{new_model}\"\n"
+        f"  applied: model {current if current is not None else 'unset'} -> \"{new_model}\""
+        f"  (provider=\"{new_provider}\""
+        + (f", run_target=\"{new_run_target}\"" if new_run_target else "")
+        + ")\n"
     )
     out.write(
-        "  note: agent picks up the new model on next session "
-        "(gc exports it as GC_AGENT_MODEL at spawn).\n"
+        "  note: agent picks up the new provider/model/run_target on next "
+        "session (gc routes the dispatch on the gc.provider/gc.model/"
+        "gc.run_target triple).\n"
     )
     return 0
 
@@ -839,6 +918,19 @@ def cmd_drift(args: argparse.Namespace, out: io.TextIOBase) -> int:
 
 _MODEL_LINE = re.compile(r'^(?P<indent>[ \t]*)model[ \t]*=.*$', re.MULTILINE)
 
+# The cross-provider routing target gc honors per dispatch is the metadata triple
+# gc.provider / gc.model / gc.run_target (the core ``mol-review-quorum`` formula
+# proves gc routes on it).  Applying a tier must set all three in the agent's
+# config scope so a Codex tier actually runs on Codex (not just the model name).
+_TIER_FIELDS = ("provider", "model", "run_target")
+
+
+def _field_line_re(field: str) -> "re.Pattern[str]":
+    """A MULTILINE regex matching an existing ``<field> = ...`` line in scope."""
+    return re.compile(
+        r'^(?P<indent>[ \t]*)' + re.escape(field) + r'[ \t]*=.*$', re.MULTILINE
+    )
+
 
 class ConfigResolveError(Exception):
     """Raised when the agent's config file/scope can't be resolved."""
@@ -1026,59 +1118,123 @@ def _find_agent_block(text: str, agent: str) -> Optional[tuple]:
 
 def read_model_field(target: ConfigTarget) -> Optional[str]:
     """Return the current ``model`` string for the target, or ``None`` if unset."""
+    return read_field(target, "model")
+
+
+def read_field(target: ConfigTarget, field: str) -> Optional[str]:
+    """Return the current ``<field>`` string in the target's scope, or ``None``.
+
+    Generalises :func:`read_model_field` to any scalar key (``provider`` /
+    ``model`` / ``run_target``) so the apply path can report the current routing
+    triple, not just the model.
+    """
     text = _read(target.path)
     region = text
-    offset = 0
     if target.span is not None:
         region = text[target.span[0]:target.span[1]]
-        offset = target.span[0]
+    esc = re.escape(field)
     m = re.search(
-        r'^[ \t]*model[ \t]*=[ \t]*["\']([^"\']*)["\']', region, re.MULTILINE
+        r'^[ \t]*' + esc + r'[ \t]*=[ \t]*["\']([^"\']*)["\']', region, re.MULTILINE
     )
     if m:
         return m.group(1)
     # also accept an unquoted value just in case
-    m = re.search(r'^[ \t]*model[ \t]*=[ \t]*([^\s#]+)', region, re.MULTILINE)
+    m = re.search(r'^[ \t]*' + esc + r'[ \t]*=[ \t]*([^\s#]+)', region, re.MULTILINE)
     if m:
         return m.group(1).strip().strip('"\'')
-    _ = offset  # (kept for symmetry / future precise editing)
     return None
 
 
 def set_model_field(target: ConfigTarget, model: str) -> None:
     """Write ``model = "<model>"`` into the target's scope, in place.
 
-    If a ``model`` line already exists in scope it is replaced; otherwise a new
-    line is inserted at the top of the scope body — but for an ``[[agent]]``
-    block we insert it just *after* the block's ``name = "..."`` line so the
-    block stays readable (name first).  Formatting/comments elsewhere are
-    preserved byte-for-byte.
+    Thin back-compat wrapper over :func:`set_field`.  If a ``model`` line already
+    exists in scope it is replaced; otherwise a new line is inserted at the top
+    of the scope body — but for an ``[[agent]]`` block just *after* the block's
+    ``name = "..."`` line.  Formatting/comments elsewhere are preserved
+    byte-for-byte.
+    """
+    set_field(target, "model", model)
+
+
+def set_provider_field(target: ConfigTarget, provider: str) -> None:
+    """Write ``provider = "<provider>"`` into the target's scope (see :func:`set_field`)."""
+    set_field(target, "provider", provider)
+
+
+def set_run_target_field(target: ConfigTarget, run_target: str) -> None:
+    """Write ``run_target = "<run_target>"`` into the target's scope (see :func:`set_field`)."""
+    set_field(target, "run_target", run_target)
+
+
+def set_field(target: ConfigTarget, field: str, value: str) -> None:
+    """Replace-or-insert ``<field> = "<value>"`` in the target's scope, in place.
+
+    The byte-preserving editor generalised over the field name (``provider`` /
+    ``model`` / ``run_target``).  An existing line for that field in scope is
+    replaced; otherwise a new line is inserted at the top of the scope body —
+    after the ``name = "..."`` line for an ``[[agent]]`` block so the block stays
+    readable.  Everything else is preserved byte-for-byte.
     """
     text = _read(target.path)
-    new_line = f'model = "{model}"'
+    new_line = f'{field} = "{value}"'
 
     if target.span is None:
         # flat agent.toml: whole-file scope.
-        updated = _replace_or_insert_top(text, new_line)
+        updated = _replace_or_insert_top(text, field, new_line)
     else:
         start, end = target.span
         body = text[start:end]
         after_name = target.kind == "agent_block"
         new_body = _replace_or_insert_top(
-            body, new_line, indent_from=body, after_name=after_name
+            body, field, new_line, indent_from=body, after_name=after_name
         )
         updated = text[:start] + new_body + text[end:]
 
     _atomic_write(target.path, updated)
 
 
+def set_tier_fields(
+    target: ConfigTarget,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    run_target: Optional[str] = None,
+) -> None:
+    """Route an agent to a whole tier: set ``provider`` / ``model`` / ``run_target``.
+
+    Applying a roster tier must set the full cross-provider routing target gc
+    honors per dispatch (``gc.provider`` / ``gc.model`` / ``gc.run_target``), not
+    just the model — otherwise a Codex tier would keep running on the agent's old
+    provider.  This is **additive and byte-preserving**: each present field is
+    replace-or-inserted via :func:`set_field`; ``None`` fields are left alone.
+
+    ``model`` is always intended to be passed (back-compat: the model is still
+    always written), with ``provider`` + ``run_target`` added alongside.  All
+    three are applied in one pass so callers don't re-read the file per field.
+    """
+    # Order matters only for readability of a freshly-inserted block: write
+    # provider, then model, then run_target so they land in a natural order
+    # (each insert goes after `name`, so the last-written sits closest to it;
+    # writing run_target last keeps model above it / provider at the bottom of
+    # the inserted run — harmless either way, and replaces are position-stable).
+    for field, val in (
+        ("provider", provider),
+        ("model", model),
+        ("run_target", run_target),
+    ):
+        if val is not None and val != "":
+            set_field(target, field, val)
+
+
 def _replace_or_insert_top(
     body: str,
+    field: str,
     new_line: str,
     indent_from: Optional[str] = None,
     after_name: bool = False,
 ) -> str:
-    """Replace an existing ``model =`` line in ``body`` else insert it.
+    """Replace an existing ``<field> =`` line in ``body`` else insert it.
 
     ``indent_from`` (the scope body) is used to detect an existing indentation
     convention so an inserted line matches sibling keys.  When ``after_name`` is
@@ -1086,7 +1242,7 @@ def _replace_or_insert_top(
     new line is inserted right after it; otherwise it goes at the top of the
     body (after any leading blank lines).
     """
-    m = _MODEL_LINE.search(body)
+    m = _field_line_re(field).search(body)
     if m:
         indent = m.group("indent")
         return body[: m.start()] + f"{indent}{new_line}" + body[m.end():]
@@ -1114,6 +1270,27 @@ def _replace_or_insert_top(
     lead = re.match(r'^([ \t]*\n)*', body)
     pos = lead.end() if lead else 0
     return body[:pos] + insert + body[pos:]
+
+
+# --------------------------------------------------------------------------- #
+# dispatch-side companion: the per-DISPATCH route triple
+# --------------------------------------------------------------------------- #
+
+def dispatch_metadata(cfg: Any, tier_id: str) -> dict:
+    """Return the gc bead/agent routing metadata triple for a tier.
+
+    The per-agent ``apply`` stamps the agent's *default* config; this is its
+    dispatch-side companion: the ``{gc.provider, gc.model, gc.run_target}`` a
+    caller can stamp on a single work bead to route just that dispatch to the
+    tier's provider + model + run target (the triple the core
+    ``mol-review-quorum`` formula proves gc honors per dispatch).
+    """
+    tier = cfg.tier(tier_id)
+    return {
+        "gc.provider": tier.provider,
+        "gc.model": tier.model,
+        "gc.run_target": tier.run_target,
+    }
 
 
 def backup_file(path: str) -> str:
@@ -1241,6 +1418,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rig", help="narrow the pack search to this rig")
     ap.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="print the planned change without writing")
+    ap.add_argument("--json", action="store_true",
+                    help="emit the structured apply result (incl. the per-DISPATCH "
+                    "gc.provider/gc.model/gc.run_target metadata) as JSON")
     ap.set_defaults(func=cmd_apply)
 
     aa = sub.add_parser(

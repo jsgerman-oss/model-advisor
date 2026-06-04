@@ -511,11 +511,21 @@ def auto_apply(
             continue
 
         # ---- write (back up the file once per run) ---- #
+        # Route the agent to the WHOLE chosen tier — provider + model +
+        # run_target — not just the model, so a cross-provider (e.g. Codex) tier
+        # actually runs on its provider.  Additive + byte-preserving; ``model``
+        # is still always written (back-compat).
+        chosen = cfg.tier(decision.chosen_tier)
         try:
             if target.path not in backed_up:
                 decision.backup_path = _cli.backup_file(target.path)
                 backed_up.add(target.path)
-            _cli.set_model_field(target, decision.chosen_model)
+            _cli.set_tier_fields(
+                target,
+                provider=chosen.provider,
+                model=chosen.model,
+                run_target=chosen.run_target,
+            )
             decision.status = STATUS_APPLIED
         except Exception as e:
             decision.status = STATUS_ERROR

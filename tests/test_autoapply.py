@@ -67,6 +67,7 @@ baseline_tier = "opus"
 id = "haiku"
 provider = "claude"
 model = "claude-haiku-4-5"
+run_target = "claude-haiku"
 rank = 1
 in_cost = 0.80
 out_cost = 4.00
@@ -75,6 +76,7 @@ out_cost = 4.00
 id = "sonnet"
 provider = "claude"
 model = "claude-sonnet-4-5"
+run_target = "claude-sonnet"
 rank = 2
 in_cost = 3.00
 out_cost = 15.00
@@ -83,6 +85,7 @@ out_cost = 15.00
 id = "opus"
 provider = "claude"
 model = "claude-opus-4-8"
+run_target = "claude-opus"
 rank = 3
 in_cost = 15.00
 out_cost = 75.00
@@ -326,7 +329,13 @@ def test_thin_evidence_is_not_downgraded(monkeypatch, cfg, city):
 # --------------------------------------------------------------------------- #
 
 def test_real_apply_is_byte_preserving_and_backs_up(monkeypatch, cfg, tmp_path):
-    """A flat per-agent agent.toml: model is surgically inserted, rest unchanged."""
+    """A flat per-agent agent.toml: the routing triple is surgically inserted.
+
+    Applying a tier now sets the full cross-provider routing target — provider +
+    model + run_target — so a Codex tier actually runs on Codex.  The edit stays
+    byte-preserving: the three lines are inserted and the rest of the file is
+    untouched.
+    """
     flat = (
         'scope = "rig"\n'
         'wake_mode = "fresh"\n'
@@ -350,14 +359,27 @@ def test_real_apply_is_byte_preserving_and_backs_up(monkeypatch, cfg, tmp_path):
     assert d.backup_path is not None
 
     updated = agent_toml.read_text()
-    # Surgical insert: original lines byte-for-byte present, exactly one model line.
+    # Surgical insert: original lines byte-for-byte present; the full sonnet
+    # routing triple written exactly once each.
     assert 'scope = "rig"' in updated
     assert 'wake_mode = "fresh"' in updated
     assert "max_active_sessions = 5" in updated
     assert updated.count("model = ") == 1
+    assert updated.count("provider = ") == 1
+    assert updated.count("run_target = ") == 1
     assert 'model = "claude-sonnet-4-5"' in updated
-    # The only added content is the model line; stripping it yields the original.
-    assert updated.replace('model = "claude-sonnet-4-5"\n', "") == flat
+    assert 'provider = "claude"' in updated
+    assert 'run_target = "claude-sonnet"' in updated
+    # The only added content is the routing triple; stripping the three inserted
+    # lines yields the original byte-for-byte.
+    stripped = updated
+    for line in (
+        'provider = "claude"\n',
+        'model = "claude-sonnet-4-5"\n',
+        'run_target = "claude-sonnet"\n',
+    ):
+        stripped = stripped.replace(line, "")
+    assert stripped == flat
 
     # Backup holds the ORIGINAL content, exactly once.
     baks = list(tmp_path.glob("*advisor-bak*"))
@@ -513,6 +535,176 @@ def test_cli_json_report(monkeypatch, tmp_path):
     assert by["polecat"]["per_shape"] == {"implement": "sonnet", "lookup": "sonnet"}
     assert by["refinery"]["status"] == "blocked"
     assert by["mayor"]["status"] == "blocked"
+
+
+# --------------------------------------------------------------------------- #
+# Cross-provider routing: applying a tier sets provider + model + run_target
+# so a Codex tier actually runs on Codex (not just a renamed model).
+# --------------------------------------------------------------------------- #
+
+# A cross-provider roster (Codex + Claude), cost-ordered: Codex `gpt54` is the
+# CHEAPEST tier and `sonnet` (Claude) is the most-capable baseline (tier*).  With
+# strong gpt54 evidence on every shape, the agent's conservative tier becomes a
+# genuine gate-admitted cross-provider DOWNGRADE to gpt54 — the honest path that
+# proves auto-apply routes the whole Codex triple, not just the model.
+XPROV_TOML = """
+[advisor]
+default_provider = "codex"
+baseline_tier = "sonnet"
+
+[[tier]]
+id = "gpt54"
+provider = "codex"
+model = "gpt-5.4"
+run_target = "codex-gpt54"
+rank = 1
+in_cost = 2.50
+out_cost = 10.00
+
+[[tier]]
+id = "sonnet"
+provider = "claude"
+model = "claude-sonnet-4-5"
+run_target = "claude-sonnet"
+rank = 2
+in_cost = 3.00
+out_cost = 15.00
+
+[[tolerance]]
+name = "Lenient"
+q_tol = 0.10
+multiplier = 1
+
+[[shape]]
+name = "implement"
+tol_class = "Lenient"
+[[shape]]
+name = "lookup"
+tol_class = "Lenient"
+
+[[agent]]
+name = "polecat"
+shapes = ["implement", "lookup"]
+"""
+
+
+def _xprov_cfg():
+    import tomllib
+    return madconfig.from_mapping(tomllib.loads(XPROV_TOML))
+
+
+def _xprov_codex_store(cfg):
+    """A store where polecat has earned gpt54 on BOTH shapes (gate-admitted)."""
+    recs = _wins("codex::polecat::implement::gpt54", 80) + _wins(
+        "codex::polecat::lookup::gpt54", 80
+    )
+    return _build_store(cfg, recs)
+
+
+def test_apply_codex_tier_sets_provider_model_run_target(monkeypatch, tmp_path):
+    """A gate-admitted downgrade to Codex gpt54 writes the FULL routing triple."""
+    cfg = _xprov_cfg()
+    flat = (
+        'scope = "rig"\n'
+        'model = "claude-sonnet-4-5"\n'  # current = the Claude baseline
+        'max_active_sessions = 5\n'
+    )
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text(flat, encoding="utf-8")
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    st = _xprov_codex_store(cfg)
+    rep = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat"], provider="codex", engine=madengine
+    )
+    d = rep.decisions[0]
+    assert d.status == autoapply.STATUS_APPLIED
+    assert d.chosen_tier == "gpt54"
+
+    updated = agent_toml.read_text()
+    assert 'provider = "codex"' in updated
+    assert 'model = "gpt-5.4"' in updated
+    assert 'run_target = "codex-gpt54"' in updated
+    # Each field written exactly once (replace-or-insert, no dupes).
+    assert updated.count("provider = ") == 1
+    assert updated.count("model = ") == 1
+    assert updated.count("run_target = ") == 1
+    # Surrounding lines untouched (byte-preserving).
+    assert 'scope = "rig"' in updated
+    assert "max_active_sessions = 5" in updated
+    # The old Claude model is gone (replaced in place, not duplicated).
+    assert "claude-sonnet-4-5" not in updated
+
+
+def test_apply_claude_tier_sets_provider_model_run_target(monkeypatch, tmp_path):
+    """A Claude tier write carries provider=claude + model + run_target too."""
+    cfg = _cfg()  # the main ADVISOR_TOML roster (now with run_targets)
+    flat = 'scope = "rig"\nmodel = "claude-haiku-4-5"\n'
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text(flat, encoding="utf-8")
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    # polecat strong on BOTH shapes for sonnet → conservative tier sonnet (claude).
+    recs = _wins("claude::polecat::implement::sonnet", 60) + _wins(
+        "claude::polecat::lookup::sonnet", 60
+    )
+    st = _build_store(cfg, recs)
+    rep = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat"], engine=madengine
+    )
+    d = rep.decisions[0]
+    assert d.status == autoapply.STATUS_APPLIED
+    assert d.chosen_tier == "sonnet"
+
+    updated = agent_toml.read_text()
+    assert 'provider = "claude"' in updated
+    assert 'model = "claude-sonnet-4-5"' in updated
+    assert 'run_target = "claude-sonnet"' in updated
+    assert updated.count("provider = ") == 1
+    assert updated.count("run_target = ") == 1
+
+
+def test_apply_codex_tier_idempotent_no_dupes(monkeypatch, tmp_path):
+    """Re-applying the same Codex tier is a no-op: no duplicated routing lines."""
+    cfg = _xprov_cfg()
+    agent_toml = tmp_path / "agent.toml"
+    # Start on the Claude baseline so the first run is a real gpt54 downgrade.
+    agent_toml.write_text(
+        'scope = "rig"\nmodel = "claude-sonnet-4-5"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    st = _xprov_codex_store(cfg)
+    rep1 = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat"], provider="codex", engine=madengine
+    )
+    assert rep1.decisions[0].status == autoapply.STATUS_APPLIED
+    after = agent_toml.read_text()
+    assert after.count("provider = ") == 1
+    assert after.count("model = ") == 1
+    assert after.count("run_target = ") == 1
+
+    # Second run: chosen model already set → no-op; file byte-identical.
+    rep2 = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat"], provider="codex", engine=madengine
+    )
+    assert rep2.decisions[0].status == autoapply.STATUS_NOOP
+    assert agent_toml.read_text() == after  # no dupes, no churn
+
+
+def test_dispatch_metadata_returns_routing_triple():
+    """cli.dispatch_metadata(cfg, tier) → the per-DISPATCH gc.* routing triple."""
+    cfg = _xprov_cfg()
+    assert cli.dispatch_metadata(cfg, "gpt54") == {
+        "gc.provider": "codex",
+        "gc.model": "gpt-5.4",
+        "gc.run_target": "codex-gpt54",
+    }
+    assert cli.dispatch_metadata(cfg, "sonnet") == {
+        "gc.provider": "claude",
+        "gc.model": "claude-sonnet-4-5",
+        "gc.run_target": "claude-sonnet",
+    }
 
 
 def test_cli_rig_scope_label(monkeypatch, tmp_path):
