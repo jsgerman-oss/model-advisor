@@ -18,7 +18,7 @@ Sampling](https://github.com/jsgerman-oss/research/tree/main/blackrim-model-advi
 [![Decision](https://img.shields.io/badge/rule-CC--TS-0f766e?style=flat-square)]()
 [![Bound](https://img.shields.io/badge/gate-Wilson_LCB-6d28d9?style=flat-square)]()
 [![Guarantee](https://img.shields.io/badge/never-downgrades_blind-c2410c?style=flat-square)]()
-[![Scope](https://img.shields.io/badge/v1-learn_·_recommend_·_apply-555?style=flat-square)]()
+[![Scope](https://img.shields.io/badge/v1-learn_·_recommend_·_apply_·_auto--apply-555?style=flat-square)]()
 
 [**Quick start**](#quick-start) ·
 [**How it works**](#how-it-works) ·
@@ -96,11 +96,12 @@ and runs the **CC-TS decision rule** on every recommendation:
 | Layer | What it is | File |
 |-------|------------|------|
 | **Engine** | the pure, stdlib-only CC-TS decision rule + cell store | `modeladvisor/` |
-| **CLI** | `advise` / `inspect` / `apply` | `bin/advisor` |
+| **CLI** | `advise` / `inspect` / `apply` / `auto-apply` | `bin/advisor` |
 | **Skill** | teaches agents to advise-before-dispatch | `skills/use-model-advisor/SKILL.md` |
 | **Prompt fragment** | the cost-aware discipline, in every agent's context | `template-fragments/model-advisor.template.md` |
 | **Telemetry hook** | records each invocation (Stop / SubagentStop) | `overlay/…/settings.json` + `hooks/capture-invocation.sh` |
 | **Config** | the model roster + shape taxonomy + tolerance classes | `advisor.toml` |
+| **Scheduler** | a gc `order` to run `auto-apply` on a cadence (safe unless armed) | `orders/` + `docs/AUTO-APPLY.md` |
 
 ## Quick start
 
@@ -140,9 +141,12 @@ Two pure reads and one deliberate write.
 | `advisor advise <agent> <shape>` | recommend the cost-minimal tier + rationale + cost diff | no |
 | `advisor inspect <agent> <shape>` | per-tier posterior, credible quality-drop CI, the highest-value eval probe | no |
 | `advisor apply <agent>` | set the recommended tier on the agent's `model` config + reload | **yes** |
+| `advisor auto-apply [--town\|--rig N]` | sweep every agent and apply the evidence-strong tier (safest-across-shapes; dry-run by default) | **yes** |
 
-`advise`/`inspect` never dispatch, touch a bead, or change config. `apply` is the v1
-application path — **per-agent**, and only when you ask for it.
+`advise`/`inspect` never dispatch, touch a bead, or change config. `apply` is the per-agent
+application path, on demand; `auto-apply` automates that sweep across all agents —
+conservatively (never auto-downgrading thin-evidence or `Critical` cells) — and can be
+scheduled with a gc `order`. See [`docs/AUTO-APPLY.md`](docs/AUTO-APPLY.md).
 
 ## Install & uninstall
 
@@ -203,13 +207,12 @@ landscape can also supply a `priors.json` for immediate convergence. Full refere
 
 Honest about the scope line.
 
-- **v1 is learn + recommend + *per-agent* apply.** `apply` sets an agent's `model` config
-  field — coarse (it pins a tier for all of that agent's dispatches) and changeable by a
-  config edit + reload. **Per-dispatch auto-apply** (stamping the advised tier on a bead at
-  `gc sling` time) is **v2**: it needs one small gc-core seam (bind a bead's `gc.model` →
-  `GC_AGENT_MODEL` at spawn, or a `gc sling --model` flag). The plumbing half-exists; the
-  binding does not yet. Tracked on its own bead, gated on the feasibility verdict —
-  [`docs/INTEGRATION-FEASIBILITY.md`](docs/INTEGRATION-FEASIBILITY.md).
+- **Apply granularity.** v1 ships *per-agent* apply — manual (`apply`) and automated
+  (`auto-apply`, an evidence-gated sweep you can schedule). It's coarse: one tier per agent,
+  changeable by a config edit + reload. **Per-dispatch** application (the advised tier per
+  *task/shape*) is the next step — the gc-core seam is now **implemented and PR'd** to
+  `gastownhall/gascity` (the reconciler binds a work bead's `gc.model` at spawn), activating
+  once it lands. Background: [`docs/INTEGRATION-FEASIBILITY.md`](docs/INTEGRATION-FEASIBILITY.md).
 - **The reward signal is the hard part.** Bead closure is the primary channel and is fully
   supported today; reviewer/eval verdicts are higher-fidelity secondaries when present. The
   advisor only ever learns from outcomes it can attribute to a recorded dispatch.
