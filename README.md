@@ -8,7 +8,7 @@ Agents stop **overpaying for the strong model** on work a cheaper one handles ju
 well — without ever silently shipping worse work. For each `(provider, agent, shape,
 tier)` cell the advisor learns a success posterior from bead lifecycle + telemetry and
 recommends the **cheapest tier whose quality stays within tolerance, with 95%
-credibility.** A clean-room implementation of *[Conservative Constrained Thompson
+credibility.** An implementation of *[Conservative Constrained Thompson
 Sampling](https://github.com/jsgerman-oss/research/tree/main/blackrim-model-advisor-paper)*.
 
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
