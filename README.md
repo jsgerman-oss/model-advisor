@@ -255,12 +255,11 @@ Honest about the scope line.
 
 ## Research lineage
 
-model-advisor is a clean-room build of **_[Conservative Constrained Thompson Sampling for
+model-advisor is a build of **_[Conservative Constrained Thompson Sampling for
 Cost-Aware Model-Tier
 Selection](https://github.com/jsgerman-oss/research/tree/main/blackrim-model-advisor-paper)_**,
-implemented from the paper's §3 problem formulation and §5 algorithm — **not** ported from
-Blackrim's `internal/dispatch/` Go code, and depending on no Blackrim artefact, dataset, or
-offline landscape. The load-bearing parts are kept faithfully — the constrained decision
+implemented from the paper's §3 problem formulation and §5 algorithm.
+The load-bearing parts are kept faithfully; the constrained decision
 rule, the conservative LCB gate, the asymmetric loss with class multipliers, the
 `M[Critical] = ∞` hard rule, the pure-function `recommend` with its structured `reasons` —
 and adapted where gc differs: an arbitrary config-driven roster (not a fixed three tiers),
