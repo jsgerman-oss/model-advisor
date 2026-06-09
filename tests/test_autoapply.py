@@ -387,6 +387,92 @@ def test_real_apply_is_byte_preserving_and_backs_up(monkeypatch, cfg, tmp_path):
     assert baks[0].read_text() == flat
 
 
+def test_corrupt_write_is_rolled_back_not_left_broken(monkeypatch, cfg, tmp_path):
+    """validate-after-apply: a write that leaves the file unparseable is
+    restored to its pre-write content and reported as STATUS_ROLLED_BACK —
+    auto-apply can never leave behind a config gc would fail to load."""
+    from modeladvisor import cli as madcli
+
+    flat = 'scope = "rig"\n'
+    agent_toml = tmp_path / "agent.toml"
+    agent_toml.write_text(flat, encoding="utf-8")
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    recs = _wins("claude::polecat::implement::sonnet", 60) + _wins(
+        "claude::polecat::lookup::sonnet", 60
+    )
+    st = _build_store(cfg, recs)
+
+    def corrupting(target, **kw):
+        with open(target.path, "w", encoding="utf-8") as fh:
+            fh.write("[broken\n")
+
+    monkeypatch.setattr(madcli, "set_tier_fields", corrupting)
+
+    rep = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat"], engine=madengine
+    )
+    d = rep.decisions[0]
+    assert d.status == autoapply.STATUS_ROLLED_BACK
+    assert "rolled back" in d.reason
+    # the file is byte-identical to its pre-write content
+    assert agent_toml.read_text() == flat
+    # the roll-up summary counts it (and nothing reports as applied)
+    assert rep.summary()[autoapply.STATUS_ROLLED_BACK] == 1
+    assert rep.summary()[autoapply.STATUS_APPLIED] == 0
+
+
+def test_shared_file_earlier_apply_survives_later_rollback(
+    monkeypatch, cfg, city, tmp_path
+):
+    """Rollback granularity is the single write, not the per-run backup:
+    polecat's valid apply into the shared city.toml survives witness's
+    corrupted write being rolled back."""
+    from modeladvisor import cli as madcli
+
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(city))
+    # witness hand-set to haiku so the safe direction pulls it up (an apply)
+    city.write_text(
+        city.read_text().replace(
+            '[[agent]]\nname = "witness"\nscope = "rig"\n',
+            '[[agent]]\nname = "witness"\nmodel = "claude-haiku-4-5"\nscope = "rig"\n',
+        ),
+        encoding="utf-8",
+    )
+    recs = _wins("claude::polecat::implement::sonnet", 60) + _wins(
+        "claude::polecat::lookup::sonnet", 60
+    )
+    st = _build_store(cfg, recs)
+
+    real = madcli.set_tier_fields
+    calls = {"n": 0}
+
+    def corrupt_second(target, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real(target, **kw)
+        with open(target.path, "a", encoding="utf-8") as fh:
+            fh.write("[broken\n")
+
+    monkeypatch.setattr(madcli, "set_tier_fields", corrupt_second)
+
+    rep = autoapply.auto_apply(
+        cfg, st, dry_run=False, agents=["polecat", "witness"], engine=madengine
+    )
+    by = {d.agent: d for d in rep.decisions}
+    assert by["polecat"].status == autoapply.STATUS_APPLIED
+    assert by["witness"].status == autoapply.STATUS_ROLLED_BACK
+
+    text = city.read_text()
+    # polecat's applied change is still present...
+    assert 'model = "claude-sonnet-4-5"' in text
+    # ...the corrupted fragment is gone and the file still parses
+    assert "[broken" not in text
+    assert madcli.validate_toml_file(str(city)) is None
+    # witness is back to its pre-write, hand-set model
+    assert 'model = "claude-haiku-4-5"' in text
+
+
 def test_single_backup_per_run_for_shared_file(monkeypatch, cfg, city, tmp_path):
     """All agents share one city.toml → it is backed up ONCE per run."""
     monkeypatch.setenv("ADVISOR_AGENT_TOML", str(city))

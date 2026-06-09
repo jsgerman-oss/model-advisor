@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import sys
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
@@ -475,14 +476,22 @@ def cmd_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
             return 3
         if not args.dry_run:
             backup = backup_file(target.path)
-            set_tier_fields(
-                target,
-                provider=new_provider,
-                model=new_model,
-                run_target=new_run_target,
-            )
-            payload["applied"] = True
             payload["backup"] = backup
+            try:
+                set_tier_fields_validated(
+                    target,
+                    provider=new_provider,
+                    model=new_model,
+                    run_target=new_run_target,
+                )
+            except ApplyValidationError as e:
+                payload["applied"] = False
+                payload["rolled_back"] = True
+                payload["error"] = str(e)
+                json.dump(payload, out, indent=2, default=str)
+                out.write("\n")
+                return 4
+            payload["applied"] = True
         json.dump(payload, out, indent=2, default=str)
         out.write("\n")
         return 0
@@ -516,12 +525,21 @@ def cmd_apply(args: argparse.Namespace, out: io.TextIOBase) -> int:
         return 0
 
     backup = backup_file(target.path)
-    set_tier_fields(
-        target,
-        provider=new_provider,
-        model=new_model,
-        run_target=new_run_target,
-    )
+    try:
+        set_tier_fields_validated(
+            target,
+            provider=new_provider,
+            model=new_model,
+            run_target=new_run_target,
+        )
+    except ApplyValidationError as e:
+        out.write(f"  backup: {backup}\n")
+        out.write(f"  FAILED: {e}\n")
+        out.write(
+            "  the config file was restored to its pre-apply content; "
+            "nothing changed.\n"
+        )
+        return 4
 
     out.write(f"  backup: {backup}\n")
     out.write(
@@ -1274,13 +1292,78 @@ def set_tier_fields(
     # (each insert goes after `name`, so the last-written sits closest to it;
     # writing run_target last keeps model above it / provider at the bottom of
     # the inserted run — harmless either way, and replaces are position-stable).
+    #
+    # SPAN REFRESH between writes: ``target.span`` is byte offsets into the file
+    # AS RESOLVED — the first write changes the file's length, so a span-scoped
+    # (non-flat) target's offsets are stale for the second and third write.  A
+    # stale end can cut the body slice mid-line and splice bytes (e.g. an
+    # existing ``model = "...-4-5"`` near the block tail becoming
+    # ``model = "new"-4-5"``).  Re-classify the file before each subsequent
+    # write so every edit runs against fresh offsets.
+    first = True
     for field, val in (
         ("provider", provider),
         ("model", model),
         ("run_target", run_target),
     ):
-        if val is not None and val != "":
-            set_field(target, field, val)
+        if val is None or val == "":
+            continue
+        if not first and target.span is not None:
+            target = _classify_config_file(target.path, target.agent)
+        set_field(target, field, val)
+        first = False
+
+
+class ApplyValidationError(RuntimeError):
+    """A post-apply config validation failed; the write was rolled back."""
+
+
+def validate_toml_file(path: str) -> Optional[str]:
+    """Re-parse ``path`` as TOML; return ``None`` if it parses, else the error.
+
+    The read-back half of validate-after-apply: an apply that leaves the config
+    unparseable would otherwise surface only when gc next loads the file —
+    silently stopping the agent's scheduling (the bad-pin footgun).  Cheap
+    (stdlib ``tomllib`` on a small file) and side-effect free.
+    """
+    try:
+        with open(path, "rb") as fh:
+            tomllib.load(fh)
+    except tomllib.TOMLDecodeError as e:
+        return str(e)
+    except OSError as e:  # vanished / unreadable after write
+        return str(e)
+    return None
+
+
+def set_tier_fields_validated(
+    target: ConfigTarget,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    run_target: Optional[str] = None,
+) -> None:
+    """:func:`set_tier_fields` + validate-after-apply with single-write rollback.
+
+    Captures the file content immediately before writing; after the write the
+    file is re-parsed as TOML.  On a parse failure the pre-write content is
+    restored atomically and :class:`ApplyValidationError` is raised, so a
+    malformed write can never be left in place to break the next config load.
+
+    Rollback granularity is deliberately THIS write — not the once-per-run
+    ``.advisor-bak-*`` backup — so when several agents share one config file
+    (the city.toml case), an earlier valid apply from the same sweep survives a
+    later agent's failed write.
+    """
+    pre_text = _read(target.path)
+    set_tier_fields(target, provider=provider, model=model, run_target=run_target)
+    err = validate_toml_file(target.path)
+    if err is not None:
+        _atomic_write(target.path, pre_text)
+        raise ApplyValidationError(
+            f"post-apply validation failed for {target.path} "
+            f"(write rolled back): {err}"
+        )
 
 
 def _replace_or_insert_top(

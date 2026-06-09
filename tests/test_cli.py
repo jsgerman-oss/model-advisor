@@ -267,6 +267,101 @@ def test_apply_writes_flat_agent_toml_and_backs_up(monkeypatch, tmp_path):
     assert baks[0].read_text() == FLAT_AGENT_TOML
 
 
+# --------------------------------------------------------------------------- #
+# apply — triple-write span staleness regression (the bug validate-after-apply
+# first caught): replacing an existing field near a block's tail after an
+# insert grew the block must not splice bytes.
+# --------------------------------------------------------------------------- #
+
+def test_apply_block_replace_after_insert_stays_parseable(monkeypatch, tmp_path):
+    """[[agent]] block ending in an existing ``model`` line: the apply inserts
+    ``provider`` (block grows), then must REPLACE ``model`` against fresh —
+    not resolve-time — offsets.  With stale offsets the body slice cut the
+    model line mid-string and produced ``model = "new"-4-5"``."""
+    import tomllib as _toml
+
+    _install_fake(monkeypatch)
+    city = _write(
+        tmp_path,
+        "city.toml",
+        CITY_TOML_WITH_AGENT_BLOCK.replace(
+            'name = "polecat"\nscope = "rig"\nmax_active_sessions = 5\n',
+            'name = "polecat"\nscope = "rig"\nmodel = "claude-haiku-4-5"\n',
+        ),
+    )
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(city))
+
+    rc, text = _run("apply", "polecat", "--shape", "implement")
+    assert rc == 0
+
+    updated = city.read_text()
+    # parses cleanly...
+    _toml.loads(updated)
+    # ...the model was replaced exactly (no spliced remnant of the old value)
+    assert updated.count('model = "claude-sonnet-4-5"') == 1
+    assert "haiku" not in updated
+    assert '"-4-5"' not in updated
+    assert updated.count("provider = ") == 2  # [workspace] + the agent block
+    # (the fake engine supplies no run_target; empty fields are skipped)
+    assert updated.count("run_target = ") == 0
+
+
+# --------------------------------------------------------------------------- #
+# apply — validate-after-apply: a malformed write is rolled back, exit 4
+# --------------------------------------------------------------------------- #
+
+def test_validate_toml_file_unit(tmp_path):
+    good = _write(tmp_path, "good.toml", 'model = "x"\n')
+    assert cli.validate_toml_file(str(good)) is None
+    bad = _write(tmp_path, "bad.toml", "[broken\n")
+    err = cli.validate_toml_file(str(bad))
+    assert err is not None and err != ""
+
+
+def test_apply_validation_failure_rolls_back(monkeypatch, tmp_path):
+    """A write that leaves the config unparseable is restored byte-for-byte
+    and the command exits 4 — never a broken config left for gc to load."""
+    _install_fake(monkeypatch)
+    agent_toml = _write(tmp_path, "agent.toml", FLAT_AGENT_TOML)
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    def corrupting(target, **kw):
+        with open(target.path, "w", encoding="utf-8") as fh:
+            fh.write('model = "unterminated\n')
+
+    monkeypatch.setattr(cli, "set_tier_fields", corrupting)
+
+    rc, text = _run("apply", "polecat", "--shape", "implement")
+    assert rc == 4
+    assert "FAILED" in text and "restored" in text
+    # the file is byte-identical to its pre-apply content
+    assert agent_toml.read_text() == FLAT_AGENT_TOML
+    # the once-per-apply backup was still taken (and holds the original)
+    baks = list(tmp_path.glob("*advisor-bak*"))
+    assert len(baks) == 1
+    assert baks[0].read_text() == FLAT_AGENT_TOML
+
+
+def test_apply_validation_failure_json(monkeypatch, tmp_path):
+    _install_fake(monkeypatch)
+    agent_toml = _write(tmp_path, "agent.toml", FLAT_AGENT_TOML)
+    monkeypatch.setenv("ADVISOR_AGENT_TOML", str(agent_toml))
+
+    def corrupting(target, **kw):
+        with open(target.path, "w", encoding="utf-8") as fh:
+            fh.write("[broken\n")
+
+    monkeypatch.setattr(cli, "set_tier_fields", corrupting)
+
+    rc, text = _run("apply", "polecat", "--shape", "implement", "--json")
+    assert rc == 4
+    obj = json.loads(text)
+    assert obj["applied"] is False
+    assert obj["rolled_back"] is True
+    assert "error" in obj and "rolled back" in obj["error"]
+    assert agent_toml.read_text() == FLAT_AGENT_TOML
+
+
 def test_apply_writes_into_matching_agent_block(monkeypatch, tmp_path):
     """`model` must land inside the [[agent]] name="polecat" block, not mayor's."""
     _install_fake(monkeypatch)

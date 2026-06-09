@@ -90,6 +90,7 @@ STATUS_BLOCKED = "blocked"  # Critical / force_baseline agent — never touched
 STATUS_SKIPPED = "skipped"  # a change was computed but the gate withheld it
 STATUS_DRYRUN = "dry-run"  # a change is planned but --dry-run is in effect
 STATUS_ERROR = "error"  # could not resolve config / compute (per-agent isolated)
+STATUS_ROLLED_BACK = "rolled-back"  # write failed post-apply validation; file restored
 
 
 @dataclass
@@ -167,6 +168,7 @@ class AutoApplyReport:
             STATUS_NOOP: self.count(STATUS_NOOP),
             STATUS_SKIPPED: self.count(STATUS_SKIPPED),
             STATUS_BLOCKED: self.count(STATUS_BLOCKED),
+            STATUS_ROLLED_BACK: self.count(STATUS_ROLLED_BACK),
             STATUS_ERROR: self.count(STATUS_ERROR),
         }
 
@@ -514,19 +516,26 @@ def auto_apply(
         # Route the agent to the WHOLE chosen tier — provider + model +
         # run_target — not just the model, so a cross-provider (e.g. Codex) tier
         # actually runs on its provider.  Additive + byte-preserving; ``model``
-        # is still always written (back-compat).
+        # is still always written (back-compat).  The validated write re-parses
+        # the file afterwards and restores the pre-write content on a parse
+        # failure (single-write granularity — earlier same-file applies from
+        # this sweep survive), so a malformed write can never be left in place
+        # to break the next config load.
         chosen = cfg.tier(decision.chosen_tier)
         try:
             if target.path not in backed_up:
                 decision.backup_path = _cli.backup_file(target.path)
                 backed_up.add(target.path)
-            _cli.set_tier_fields(
+            _cli.set_tier_fields_validated(
                 target,
                 provider=chosen.provider,
                 model=chosen.model,
                 run_target=chosen.run_target,
             )
             decision.status = STATUS_APPLIED
+        except _cli.ApplyValidationError as e:
+            decision.status = STATUS_ROLLED_BACK
+            decision.reason = f"write rolled back (config restored): {e}"
         except Exception as e:
             decision.status = STATUS_ERROR
             decision.reason = f"write failed: {e}"
